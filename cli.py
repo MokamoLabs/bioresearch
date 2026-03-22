@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
@@ -123,6 +124,120 @@ def _make_modal_runner(domain: str):
     return runner
 
 
+def _make_local_runner():
+    """Create a local sequential seed runner using the Colab/local GPU."""
+    from engine.loop import run_local_experiment
+    from engine.metrics import SeedResult
+
+    def runner(domain_dir: str, train_code: str, seeds: list[int], time_budget: int) -> list[SeedResult]:
+        results = []
+        for seed in seeds:
+            print(f"  [local] Running seed {seed}...", end=" ", flush=True)
+            result = run_local_experiment(domain_dir, train_code, seed, time_budget)
+            status = "OK" if result.success else f"FAIL: {result.error[:80] if result.error else 'unknown'}"
+            print(status)
+            results.append(result)
+        return results
+
+    return runner
+
+
+def _make_prescreen_runner(domain: str):
+    """
+    Create a pre-screen runner: run 1 seed locally first as sanity check.
+    If it fails, skip Modal dispatch entirely (saves cost).
+    If it passes, dispatch remaining seeds to Modal.
+    """
+    from engine.loop import run_local_experiment
+    from engine.metrics import SeedResult
+
+    modal_runner = _make_modal_runner(domain)
+    if modal_runner is None:
+        print("Modal unavailable. Pre-screen mode falling back to full local.")
+        return _make_local_runner()
+
+    def runner(domain_dir: str, train_code: str, seeds: list[int], time_budget: int) -> list[SeedResult]:
+        if not seeds:
+            return []
+
+        prescreen_seed = seeds[0]
+        remaining_seeds = seeds[1:]
+
+        print(f"  [prescreen] Running seed {prescreen_seed} locally...", end=" ", flush=True)
+        prescreen_result = run_local_experiment(domain_dir, train_code, prescreen_seed, time_budget)
+
+        if not prescreen_result.success:
+            print(f"FAIL: {prescreen_result.error[:80] if prescreen_result.error else 'unknown'}")
+            print(f"  [prescreen] Pre-screen failed. Skipping Modal dispatch for {len(remaining_seeds)} seeds.")
+            results = [prescreen_result]
+            for seed in remaining_seeds:
+                results.append(SeedResult(
+                    seed=seed,
+                    metrics={},
+                    train_seconds=0.0,
+                    success=False,
+                    error=f"Skipped: pre-screen seed {prescreen_seed} failed",
+                ))
+            return results
+
+        print("OK")
+        print(f"  [prescreen] Pre-screen passed. Dispatching {len(remaining_seeds)} seeds to Modal...")
+
+        if remaining_seeds:
+            modal_results = modal_runner(domain_dir, train_code, remaining_seeds, time_budget)
+            return [prescreen_result] + modal_results
+        return [prescreen_result]
+
+    return runner
+
+
+def _make_hybrid_runner(domain: str):
+    """
+    Create a hybrid runner: run seed 0 on local GPU and remaining seeds
+    on Modal simultaneously using ThreadPoolExecutor.
+    """
+    from engine.loop import run_local_experiment
+
+    modal_runner = _make_modal_runner(domain)
+    if modal_runner is None:
+        print("Modal unavailable. Hybrid mode falling back to full local.")
+        return _make_local_runner()
+
+    def runner(domain_dir: str, train_code: str, seeds: list[int], time_budget: int) -> list:
+        if not seeds:
+            return []
+
+        local_seed = seeds[0]
+        modal_seeds = seeds[1:]
+
+        def run_local():
+            print(f"  [hybrid/local] Running seed {local_seed} on local GPU...")
+            result = run_local_experiment(domain_dir, train_code, local_seed, time_budget)
+            status = "OK" if result.success else "FAIL"
+            print(f"  [hybrid/local] Seed {local_seed}: {status}")
+            return result
+
+        def run_modal():
+            if not modal_seeds:
+                return []
+            print(f"  [hybrid/modal] Dispatching seeds {modal_seeds} to Modal...")
+            results = modal_runner(domain_dir, train_code, modal_seeds, time_budget)
+            succeeded = sum(1 for r in results if r.success)
+            print(f"  [hybrid/modal] {succeeded}/{len(results)} seeds succeeded")
+            return results
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            local_future = executor.submit(run_local)
+            modal_future = executor.submit(run_modal)
+
+            local_result = local_future.result()
+            modal_results = modal_future.result()
+
+        return [local_result] + modal_results
+
+    return runner
+
+
 def cmd_search(args):
     """Run autoresearch loop for a domain."""
     from engine.loop import LoopConfig, autoresearch_loop
@@ -134,17 +249,33 @@ def cmd_search(args):
     metric_specs = _get_metric_specs(args.domain)
     knowledge_fn = _make_knowledge_fn(args.domain)
 
-    # Set up Modal if requested
+    # Set up compute runner based on mode
     run_seeds_parallel = None
-    if args.modal:
+    compute_mode = args.compute
+
+    if compute_mode == "modal":
         run_seeds_parallel = _make_modal_runner(args.domain)
         if run_seeds_parallel:
-            print("Using Modal for parallel GPU execution.")
+            print("Compute mode: Modal (all seeds on cloud GPUs)")
         else:
-            print("Modal unavailable. Using local sequential execution.")
+            print("Modal unavailable. Falling back to local sequential execution.")
+            compute_mode = "local"
+
+    if compute_mode == "local":
+        run_seeds_parallel = _make_local_runner()
+        print("Compute mode: Local (all seeds on local GPU, sequential)")
+    elif compute_mode == "prescreen":
+        run_seeds_parallel = _make_prescreen_runner(args.domain)
+        print("Compute mode: Pre-screen (1 local sanity check, then Modal)")
+    elif compute_mode == "hybrid":
+        run_seeds_parallel = _make_hybrid_runner(args.domain)
+        print("Compute mode: Hybrid (1 local + remaining on Modal, parallel)")
 
     orch_config = OrchestratorConfig(
         model=args.model or "claude-opus-4-6",
+        backend=args.backend,
+        vertex_project_id=args.vertex_project or "",
+        vertex_region=args.vertex_region,
     )
 
     if args.population and args.population > 1:
@@ -280,8 +411,18 @@ def main():
     search_parser.add_argument("--seeds", type=int, default=5)
     search_parser.add_argument("--time-budget", type=int, default=600)
     search_parser.add_argument("--population", type=int, default=0, help="Number of agents for population search (0=single)")
-    search_parser.add_argument("--modal", action="store_true", help="Use Modal for parallel GPU execution")
+    search_parser.add_argument("--compute", type=str, default="modal",
+                               choices=["modal", "local", "prescreen", "hybrid"],
+                               help="Compute mode: modal (all Modal), local (all local GPU), "
+                                    "prescreen (1 local then Modal), hybrid (1 local + Modal parallel)")
     search_parser.add_argument("--model", type=str, default=None, help="Claude model to use (default: claude-opus-4-6)")
+    search_parser.add_argument("--backend", type=str, default="anthropic",
+                               choices=["anthropic", "vertex"],
+                               help="Claude API backend (default: anthropic)")
+    search_parser.add_argument("--vertex-project", type=str, default=None,
+                               help="GCP project ID for Vertex AI backend")
+    search_parser.add_argument("--vertex-region", type=str, default="us-east5",
+                               help="GCP region for Vertex AI backend (default: us-east5)")
 
     # predict command
     predict_parser = subparsers.add_parser("predict", help="Run prediction")

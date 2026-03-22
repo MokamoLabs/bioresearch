@@ -3,6 +3,7 @@
 import os
 import tempfile
 import time
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from engine.metrics import (
     SeedResult,
     evaluate_experiment,
 )
+from engine.orchestrator import OrchestratorConfig
 from engine.tracker import ExperimentTracker, ExperimentRecord
 
 
@@ -168,3 +170,195 @@ class TestMetricSpec:
         # 20% degradation
         frac = spec.degradation_fraction(0.64, 0.8)
         assert abs(frac - 0.2) < 1e-6
+
+
+class TestOrchestratorConfig:
+    def test_defaults(self):
+        config = OrchestratorConfig()
+        assert config.backend == "anthropic"
+        assert config.vertex_project_id == ""
+        assert config.vertex_region == "us-east5"
+        assert config.model == "claude-opus-4-6"
+
+    def test_vertex_config(self):
+        config = OrchestratorConfig(
+            backend="vertex",
+            vertex_project_id="my-project",
+            vertex_region="europe-west1",
+        )
+        assert config.backend == "vertex"
+        assert config.vertex_project_id == "my-project"
+        assert config.vertex_region == "europe-west1"
+
+
+class TestClientFactory:
+    def test_anthropic_client_with_key(self):
+        from engine.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = os.path.join(tmpdir, "domain")
+            os.makedirs(domain_dir)
+            # Create minimal train.py and program.md
+            with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                f.write("print('hello')")
+            with open(os.path.join(domain_dir, "program.md"), "w") as f:
+                f.write("")
+
+            config = OrchestratorConfig()
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+                orch = Orchestrator(
+                    config=config,
+                    domain_dir=domain_dir,
+                    output_dir=tmpdir,
+                    metric_specs=[],
+                )
+                import anthropic
+                assert isinstance(orch.client, anthropic.Anthropic)
+
+    def test_anthropic_client_without_key(self):
+        from engine.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = os.path.join(tmpdir, "domain")
+            os.makedirs(domain_dir)
+            with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                f.write("print('hello')")
+
+            config = OrchestratorConfig()
+            env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+            with patch.dict(os.environ, env, clear=True):
+                with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY not set"):
+                    Orchestrator(
+                        config=config,
+                        domain_dir=domain_dir,
+                        output_dir=tmpdir,
+                        metric_specs=[],
+                    )
+
+    def test_vertex_client_without_project_id(self):
+        from engine.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = os.path.join(tmpdir, "domain")
+            os.makedirs(domain_dir)
+            with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                f.write("print('hello')")
+
+            config = OrchestratorConfig(backend="vertex")
+            env = {k: v for k, v in os.environ.items() if k != "VERTEX_PROJECT_ID"}
+            with patch.dict(os.environ, env, clear=True):
+                # Mock AnthropicVertex so we don't need the dependency
+                mock_vertex = MagicMock()
+                with patch.dict("sys.modules", {"anthropic": MagicMock(AnthropicVertex=mock_vertex)}):
+                    with pytest.raises(RuntimeError, match="Vertex AI requires a GCP project ID"):
+                        Orchestrator(
+                            config=config,
+                            domain_dir=domain_dir,
+                            output_dir=tmpdir,
+                            metric_specs=[],
+                        )
+
+    def test_vertex_client_with_config(self):
+        from engine.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = os.path.join(tmpdir, "domain")
+            os.makedirs(domain_dir)
+            with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                f.write("print('hello')")
+
+            config = OrchestratorConfig(
+                backend="vertex",
+                vertex_project_id="test-project",
+                vertex_region="us-east5",
+            )
+            mock_vertex_cls = MagicMock()
+            # Patch AnthropicVertex on the anthropic module that orchestrator imports
+            import anthropic as anthropic_mod
+            with patch.object(anthropic_mod, "AnthropicVertex", mock_vertex_cls, create=True):
+                orch = Orchestrator(
+                    config=config,
+                    domain_dir=domain_dir,
+                    output_dir=tmpdir,
+                    metric_specs=[],
+                )
+                mock_vertex_cls.assert_called_once_with(
+                    project_id="test-project", region="us-east5"
+                )
+
+
+class TestComputeRunners:
+    def test_local_runner_interface(self):
+        from cli import _make_local_runner
+        runner = _make_local_runner()
+        assert callable(runner)
+
+    def test_local_runner_with_broken_code(self):
+        from cli import _make_local_runner
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = os.path.join(tmpdir, "domain")
+            os.makedirs(domain_dir)
+            with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                f.write("print('placeholder')")
+
+            runner = _make_local_runner()
+            results = runner(domain_dir, "raise Exception('broken')", [0, 1], 10)
+            assert len(results) == 2
+            assert not results[0].success
+            assert not results[1].success
+
+    def test_prescreen_runner_skips_modal_on_failure(self):
+        from cli import _make_prescreen_runner
+        from engine.metrics import SeedResult
+
+        # Mock _make_modal_runner to track if Modal is called
+        modal_called = []
+        def mock_modal_runner(domain_dir, train_code, seeds, time_budget):
+            modal_called.append(True)
+            return [SeedResult(seed=s, metrics={"acc": 0.5}) for s in seeds]
+
+        with patch("cli._make_modal_runner", return_value=mock_modal_runner):
+            runner = _make_prescreen_runner("perturbation")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                domain_dir = os.path.join(tmpdir, "domain")
+                os.makedirs(domain_dir)
+                with open(os.path.join(domain_dir, "train.py"), "w") as f:
+                    f.write("print('placeholder')")
+
+                results = runner(domain_dir, "raise Exception('broken')", [0, 1, 2], 10)
+                assert len(results) == 3
+                assert not results[0].success  # pre-screen failed
+                assert not results[1].success  # skipped
+                assert not results[2].success  # skipped
+                assert len(modal_called) == 0  # Modal was never called
+
+
+class TestRecommendComputeMode:
+    def test_high_end_gpu_with_modal(self):
+        from infra.colab import recommend_compute_mode
+        result = recommend_compute_mode(
+            {"has_gpu": True, "gpu_name": "NVIDIA H100", "vram_gb": 80.0},
+            modal_ok=True,
+        )
+        assert result == "hybrid"
+
+    def test_low_end_gpu_with_modal(self):
+        from infra.colab import recommend_compute_mode
+        result = recommend_compute_mode(
+            {"has_gpu": True, "gpu_name": "Tesla T4", "vram_gb": 16.0},
+            modal_ok=True,
+        )
+        assert result == "prescreen"
+
+    def test_gpu_without_modal(self):
+        from infra.colab import recommend_compute_mode
+        result = recommend_compute_mode(
+            {"has_gpu": True, "gpu_name": "Tesla T4", "vram_gb": 16.0},
+            modal_ok=False,
+        )
+        assert result == "local"
+
+    def test_no_gpu_with_modal(self):
+        from infra.colab import recommend_compute_mode
+        result = recommend_compute_mode(
+            {"has_gpu": False, "gpu_name": "none", "vram_gb": 0.0},
+            modal_ok=True,
+        )
+        assert result == "modal"

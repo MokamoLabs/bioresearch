@@ -47,6 +47,9 @@ class OrchestratorConfig:
     program_file: str = "program.md"
     max_prompt_tokens: int = 100000  # approximate budget for the prompt
     max_history_items: int = 15
+    backend: str = "anthropic"  # "anthropic" or "vertex"
+    vertex_project_id: str = ""
+    vertex_region: str = "global"
 
 
 @dataclass
@@ -94,16 +97,46 @@ class Orchestrator:
         self.baseline_code = self.current_code
         self.best_code = self.current_code
 
-        # Validate API key before starting
+        self.client = self._create_client(config)
+        self.tracker = ExperimentTracker(str(self.output_dir))
+
+    def _create_client(self, config: OrchestratorConfig):
+        """Create the appropriate Anthropic client based on backend config."""
+        if config.backend == "vertex":
+            return self._create_vertex_client(config)
+        return self._create_anthropic_client()
+
+    def _create_anthropic_client(self):
+        """Create a direct Anthropic API client."""
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "ANTHROPIC_API_KEY not set. Set it with:\n"
                 "  export ANTHROPIC_API_KEY=your-key-here"
             )
+        return anthropic.Anthropic()
 
-        self.client = anthropic.Anthropic()
-        self.tracker = ExperimentTracker(str(self.output_dir))
+    def _create_vertex_client(self, config: OrchestratorConfig):
+        """Create an Anthropic client via Google Cloud Vertex AI."""
+        try:
+            from anthropic import AnthropicVertex
+        except ImportError:
+            raise RuntimeError(
+                "Vertex AI support requires anthropic[vertex]. Install with:\n"
+                "  pip install 'anthropic[vertex]'"
+            )
+
+        project_id = config.vertex_project_id or os.environ.get("VERTEX_PROJECT_ID", "")
+        region = config.vertex_region or os.environ.get("VERTEX_REGION", "us-east5")
+
+        if not project_id:
+            raise RuntimeError(
+                "Vertex AI requires a GCP project ID. Set it via:\n"
+                "  OrchestratorConfig(vertex_project_id='my-project') or\n"
+                "  export VERTEX_PROJECT_ID=my-project"
+            )
+
+        return AnthropicVertex(project_id=project_id, region=region)
 
     def _read_file(self, path: Path) -> str:
         return path.read_text() if path.exists() else ""

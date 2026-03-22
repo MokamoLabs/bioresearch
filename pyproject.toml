@@ -32,11 +32,15 @@ web = [
 infra = [
     "modal>=0.64.0",
 ]
+vertex = [
+    "anthropic[vertex]>=0.40.0",
+    "google-auth>=2.0.0",
+]
 dev = [
     "pytest>=7.0.0",
 ]
 all = [
-    "bioresearch[bio,chem,gpu,web,infra]",
+    "bioresearch[bio,chem,gpu,web,infra,vertex]",
 ]
 
 [project.scripts]
