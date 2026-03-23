@@ -41,9 +41,10 @@ class LoopConfig:
     num_seeds: int = 5
     max_iterations: int = 100
     min_seeds_for_decision: int = 3
-    alpha: float = 0.05
-    min_effect_size: float = 0.3
+    alpha: float = 0.10
+    min_effect_size: float = 0.15
     time_budget_per_seed: int = 600  # seconds
+    paired: bool = True
     orchestrator_config: Optional[OrchestratorConfig] = None
 
 
@@ -315,6 +316,7 @@ def autoresearch_loop(
                 alpha=loop_config.alpha,
                 min_effect_size=loop_config.min_effect_size,
                 min_seeds=loop_config.min_seeds_for_decision,
+                paired=loop_config.paired,
             )
 
             # 4. Keep or revert

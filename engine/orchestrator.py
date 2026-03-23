@@ -157,16 +157,23 @@ class Orchestrator:
 ## Metric Specifications
 {metric_desc}
 
+## How Evaluation Works
+- Each experiment runs across multiple seeds. Each seed uses the SAME dataset but a different 90% random subsample of training data.
+- Your modification is compared to the baseline using a **paired one-sided t-test** (p < 0.10) and paired Cohen's d (> 0.15).
+- Genuine improvements that consistently help across seeds WILL be detected and kept.
+- Introduce stochastic elements (e.g., weight initialization, dropout, data augmentation) controlled by the SEED variable for robust evaluation.
+
 ## Rules
 1. You ONLY modify train.py. The evaluation harness in prepare.py is FROZEN.
 2. Each experiment runs for a fixed time budget across multiple seeds.
-3. Your changes are kept only if they produce statistically significant improvement (p < 0.05, Cohen's d > 0.3).
+3. Your changes are kept only if they produce statistically significant improvement.
 4. You must output ONLY the complete, modified train.py content between <train_py> and </train_py> tags.
 5. Before the code, briefly explain your hypothesis in 1-2 sentences between <hypothesis> and </hypothesis> tags.
 6. Think carefully about what might work. Consider the biological domain knowledge provided.
 7. Make one focused change per iteration. Do not combine multiple unrelated ideas.
 8. The code must be complete and runnable. Do not use placeholders or TODOs.
 9. Preserve the output format: metrics must be printed as JSON on the last line of stdout.
+10. Keep the seed-controlled training subsample logic (rng = np.random.RandomState(SEED); subsample 90% of training data). This ensures meaningful statistical evaluation.
 """
 
     def _format_metric_specs(self) -> str:

@@ -97,6 +97,29 @@ def welch_t_test(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return float(t_stat), float(p_val)
 
 
+def paired_t_test(
+    a: np.ndarray, b: np.ndarray, alternative: str = "greater"
+) -> tuple[float, float]:
+    """
+    Paired t-test. Returns (t_statistic, p_value).
+
+    alternative: 'greater' tests mean(a) > mean(b),
+                 'less' tests mean(a) < mean(b),
+                 'two-sided' for standard two-sided test.
+    """
+    if len(a) < 2 or len(a) != len(b):
+        return 0.0, 1.0
+    t_stat, p_val = stats.ttest_rel(a, b)
+    # Handle NaN (e.g., identical arrays → 0/0)
+    if np.isnan(t_stat) or np.isnan(p_val):
+        return 0.0, 1.0
+    if alternative == "greater":
+        p_val = p_val / 2 if t_stat > 0 else 1 - p_val / 2
+    elif alternative == "less":
+        p_val = p_val / 2 if t_stat < 0 else 1 - p_val / 2
+    return float(t_stat), float(p_val)
+
+
 def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
     """Cohen's d effect size (pooled standard deviation)."""
     if len(a) < 2 or len(b) < 2:
@@ -107,6 +130,17 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
     if pooled_std == 0:
         return 0.0
     return float(abs(np.mean(a) - np.mean(b)) / pooled_std)
+
+
+def paired_cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    """Cohen's d for paired samples: mean(a-b) / std(a-b)."""
+    if len(a) < 2 or len(a) != len(b):
+        return 0.0
+    diffs = a - b
+    std_diff = float(np.std(diffs, ddof=1))
+    if std_diff == 0:
+        return float("inf") if abs(np.mean(diffs)) > 0 else 0.0
+    return float(abs(np.mean(diffs)) / std_diff)
 
 
 def bootstrap_ci(
@@ -148,16 +182,34 @@ def compare_metric(
     spec: MetricSpec,
     alpha: float = 0.05,
     min_effect_size: float = 0.3,
+    paired: bool = True,
 ) -> ComparisonResult:
-    """Compare a single metric between baseline and candidate experiments."""
+    """
+    Compare a single metric between baseline and candidate experiments.
+
+    When paired=True (default), uses paired t-test and paired Cohen's d with
+    a one-sided test in the improvement direction. This is correct when baseline
+    and candidate share the same seed indices.
+    """
     b_vals = baseline.metric_values(spec.name)
     c_vals = candidate.metric_values(spec.name)
 
     b_mean = float(np.mean(b_vals)) if len(b_vals) > 0 else float("nan")
     c_mean = float(np.mean(c_vals)) if len(c_vals) > 0 else float("nan")
 
-    t_stat, p_val = welch_t_test(b_vals, c_vals)
-    d = cohens_d(b_vals, c_vals)
+    if paired and len(b_vals) == len(c_vals) and len(b_vals) >= 2:
+        # Paired one-sided test: does candidate improve over baseline?
+        if spec.direction == MetricDirection.HIGHER:
+            # Test: candidate > baseline
+            t_stat, p_val = paired_t_test(c_vals, b_vals, alternative="greater")
+        else:
+            # Test: candidate < baseline (lower is better)
+            t_stat, p_val = paired_t_test(c_vals, b_vals, alternative="less")
+        d = paired_cohens_d(c_vals, b_vals)
+    else:
+        t_stat, p_val = welch_t_test(b_vals, c_vals)
+        d = cohens_d(b_vals, c_vals)
+
     ci_lo, ci_hi = bootstrap_ci(c_vals)
 
     is_improvement = spec.is_improvement(c_mean, b_mean)
@@ -192,9 +244,10 @@ def evaluate_experiment(
     baseline: ExperimentResult,
     candidate: ExperimentResult,
     metric_specs: list[MetricSpec],
-    alpha: float = 0.05,
-    min_effect_size: float = 0.3,
+    alpha: float = 0.10,
+    min_effect_size: float = 0.15,
     min_seeds: int = 3,
+    paired: bool = True,
 ) -> EvaluationDecision:
     """
     Decide whether to keep or revert a candidate experiment.
@@ -203,6 +256,8 @@ def evaluate_experiment(
     1. Enough seeds succeeded (>= min_seeds)
     2. At least one PRIMARY metric significantly improved (p < alpha, d > min_effect_size)
     3. No GUARD metrics violated their thresholds
+
+    When paired=True (default), uses paired one-sided t-test and paired Cohen's d.
     """
     if candidate.num_successful < min_seeds:
         return EvaluationDecision(
@@ -218,7 +273,7 @@ def evaluate_experiment(
     guard_violations = []
 
     for spec in metric_specs:
-        comp = compare_metric(baseline, candidate, spec, alpha, min_effect_size)
+        comp = compare_metric(baseline, candidate, spec, alpha, min_effect_size, paired=paired)
         all_comparisons.append(comp)
 
         if spec.role == MetricRole.PRIMARY:

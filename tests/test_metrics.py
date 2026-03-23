@@ -10,7 +10,9 @@ from engine.metrics import (
     ExperimentResult,
     SeedResult,
     welch_t_test,
+    paired_t_test,
     cohens_d,
+    paired_cohens_d,
     bootstrap_ci,
     compare_metric,
     evaluate_experiment,
@@ -62,6 +64,59 @@ class TestCohensD:
         b = rng.randn(100) + 0.1  # Small shift
         d = cohens_d(a, b)
         assert 0 < d < 0.5
+
+
+class TestPairedTTest:
+    def test_identical_samples(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        _, p = paired_t_test(a, a.copy(), alternative="greater")
+        assert p > 0.4  # Not significant
+
+    def test_clearly_better(self):
+        a = np.array([1.1, 2.1, 3.1, 4.1, 5.1])
+        b = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        _, p = paired_t_test(a, b, alternative="greater")
+        assert p < 0.01  # Highly significant (consistent improvement)
+
+    def test_one_sided_direction(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([1.1, 2.1, 3.1, 4.1, 5.1])
+        # a < b, so "greater" test for a should NOT be significant
+        _, p = paired_t_test(a, b, alternative="greater")
+        assert p > 0.9
+
+    def test_mismatched_lengths(self):
+        a = np.array([1.0, 2.0])
+        b = np.array([1.0, 2.0, 3.0])
+        _, p = paired_t_test(a, b)
+        assert p == 1.0
+
+    def test_too_few_samples(self):
+        a = np.array([1.0])
+        b = np.array([2.0])
+        _, p = paired_t_test(a, b)
+        assert p == 1.0
+
+
+class TestPairedCohensD:
+    def test_no_difference(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        d = paired_cohens_d(a, a.copy())
+        assert d == 0.0
+
+    def test_consistent_shift(self):
+        a = np.array([1.1, 2.1, 3.1, 4.1, 5.1])
+        b = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        d = paired_cohens_d(a, b)
+        # All diffs are ~0.1, std(diffs) near 0 → d is very large
+        assert d > 100
+
+    def test_noisy_improvement(self):
+        rng = np.random.RandomState(42)
+        a = rng.randn(10) + 0.5  # shifted up
+        b = rng.randn(10)
+        d = paired_cohens_d(a, b)
+        assert d > 0
 
 
 class TestBootstrapCI:
@@ -198,5 +253,45 @@ class TestEvaluateExperiment:
             seed_results=[SeedResult(seed=i, metrics={"primary": v}) for i, v in enumerate(candidate_vals)],
         )
 
-        decision = evaluate_experiment(baseline, candidate, specs)
+        # Use strict thresholds to ensure revert on noisy tiny improvement
+        decision = evaluate_experiment(baseline, candidate, specs, alpha=0.05, min_effect_size=0.3, paired=False)
         assert not decision.keep  # Not significant enough
+
+    def test_keep_on_paired_consistent_improvement(self):
+        """With paired testing, consistent small improvements across seeds are detectable."""
+        specs = [MetricSpec("primary", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        # High cross-seed variance, but each candidate is consistently 0.05 better than its paired baseline
+        baseline_vals = [0.70, 0.80, 0.60, 0.75, 0.65]
+        candidate_vals = [0.75, 0.85, 0.65, 0.80, 0.70]
+
+        baseline = ExperimentResult(
+            experiment_id="base", description="base",
+            seed_results=[SeedResult(seed=i, metrics={"primary": v}) for i, v in enumerate(baseline_vals)],
+        )
+        candidate = ExperimentResult(
+            experiment_id="cand", description="cand",
+            seed_results=[SeedResult(seed=i, metrics={"primary": v}) for i, v in enumerate(candidate_vals)],
+        )
+
+        decision = evaluate_experiment(baseline, candidate, specs, paired=True)
+        assert decision.keep  # Consistent paired improvement should be kept
+
+    def test_revert_on_unpaired_same_data(self):
+        """Same data as above but unpaired testing with strict thresholds can't detect the improvement."""
+        specs = [MetricSpec("primary", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        # Same high-variance data — unpaired test sees overlapping distributions
+        baseline_vals = [0.70, 0.80, 0.60, 0.75, 0.65]
+        candidate_vals = [0.75, 0.85, 0.65, 0.80, 0.70]
+
+        baseline = ExperimentResult(
+            experiment_id="base", description="base",
+            seed_results=[SeedResult(seed=i, metrics={"primary": v}) for i, v in enumerate(baseline_vals)],
+        )
+        candidate = ExperimentResult(
+            experiment_id="cand", description="cand",
+            seed_results=[SeedResult(seed=i, metrics={"primary": v}) for i, v in enumerate(candidate_vals)],
+        )
+
+        # Unpaired with strict alpha — can't detect the small improvement buried in noise
+        decision = evaluate_experiment(baseline, candidate, specs, alpha=0.05, min_effect_size=0.3, paired=False)
+        assert not decision.keep  # Unpaired can't detect the improvement through the variance

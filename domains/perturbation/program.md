@@ -18,12 +18,15 @@ post-perturbation gene expression given control expression and a perturbation la
 - Must output metrics as JSON on the last line of stdout.
 - Can use numpy, scipy, and torch (if GPU available).
 - Can import from `knowledge.retrieval` to access biological priors.
+- Each seed uses the same dataset but a different 90% subsample of training data.
+  Keep the seed-controlled subsample logic intact so evaluation is meaningful.
 
 ## Metric Specifications
 - **pearson_deg** [PRIMARY]: Pearson correlation on top-20 DEGs per perturbation.
   Higher is better. This is the hardest, most informative metric.
 - **mse_top20_deg** [GUARD]: MSE on top-20 DEGs. Must not degrade >10%.
 - **direction_acc** [GUARD]: Up/down direction accuracy. Must stay >0.7.
+  (Note: baseline is near 0 for unseen perturbations — guard effectively inactive.)
 - **cross_context** [BONUS]: Generalization gap across cell types. Lower is better.
 - **pearson_all** [DIAGNOSTIC]: Pearson on all genes. Reported only.
 

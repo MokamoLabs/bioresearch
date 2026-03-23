@@ -18,7 +18,7 @@ def check_gpu() -> dict:
         if torch.cuda.is_available():
             info["has_gpu"] = True
             info["gpu_name"] = torch.cuda.get_device_name(0)
-            info["vram_gb"] = torch.cuda.get_device_properties(0).total_mem / 1e9
+            info["vram_gb"] = torch.cuda.get_device_properties(0).total_memory / 1e9
             print(f"GPU: {info['gpu_name']} ({info['vram_gb']:.1f} GB)")
         else:
             print("No GPU available. Will use Modal for GPU compute.")

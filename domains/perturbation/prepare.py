@@ -47,6 +47,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SEED = int(os.environ.get("SEED", "42"))
+DATA_SEED = 42  # Fixed seed for data generation — never changes across experiment seeds
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "600"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.expanduser("~/.cache/bioresearch/perturbation"))
 N_TOP_DEGS = 20
@@ -116,8 +117,8 @@ def load_data(dataset_name: str = "norman_2019", n_genes: int = N_GENES) -> Pert
 
 
 def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_pert: int = 50) -> PerturbationDataset:
-    """Create a small synthetic dataset for testing."""
-    rng = np.random.RandomState(SEED)
+    """Create a small synthetic dataset for testing. Uses DATA_SEED (fixed) for reproducibility across experiment seeds."""
+    rng = np.random.RandomState(DATA_SEED)
     n_samples = n_perts * n_cells_per_pert
 
     # Generate control expression

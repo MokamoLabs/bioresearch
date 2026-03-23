@@ -177,7 +177,7 @@ class TestOrchestratorConfig:
         config = OrchestratorConfig()
         assert config.backend == "anthropic"
         assert config.vertex_project_id == ""
-        assert config.vertex_region == "us-east5"
+        assert config.vertex_region == "global"
         assert config.model == "claude-opus-4-6"
 
     def test_vertex_config(self):

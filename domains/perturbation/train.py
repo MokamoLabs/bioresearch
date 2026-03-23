@@ -80,10 +80,15 @@ def main():
     print(f"Dataset: {dataset.n_samples} samples, {dataset.n_genes} genes")
     print(f"Train: {len(dataset.train_idx)}, Val: {len(dataset.val_idx)}, Test: {len(dataset.test_idx)}")
 
-    # Fit model on training data
-    train_ctrl = dataset.ctrl_expr[dataset.train_idx]
-    train_pert = dataset.pert_expr[dataset.train_idx]
-    train_names = [dataset.pert_names[i] for i in dataset.train_idx]
+    # Subsample training data for seed-controlled variance.
+    # Each seed uses a 90% random subsample of training data, giving natural
+    # variance across seeds while keeping the evaluation set fixed.
+    rng = np.random.RandomState(SEED)
+    n_subsample = int(len(dataset.train_idx) * 0.9)
+    subsample_idx = rng.choice(dataset.train_idx, n_subsample, replace=False)
+    train_ctrl = dataset.ctrl_expr[subsample_idx]
+    train_pert = dataset.pert_expr[subsample_idx]
+    train_names = [dataset.pert_names[i] for i in subsample_idx]
 
     model = LinearPerturbModel(n_genes=dataset.n_genes)
     model.fit(train_ctrl, train_pert, train_names)
