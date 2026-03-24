@@ -295,3 +295,58 @@ class TestEvaluateExperiment:
         # Unpaired with strict alpha — can't detect the small improvement buried in noise
         decision = evaluate_experiment(baseline, candidate, specs, alpha=0.05, min_effect_size=0.3, paired=False)
         assert not decision.keep  # Unpaired can't detect the improvement through the variance
+
+    def test_guard_floor_near_zero_baseline(self):
+        """When guard baseline is near zero, use absolute threshold instead of relative."""
+        specs = [
+            MetricSpec("primary", MetricRole.PRIMARY, MetricDirection.HIGHER),
+            MetricSpec("guard", MetricRole.GUARD, MetricDirection.HIGHER, guard_threshold=0.3),
+        ]
+        # Guard baseline is near zero (0.017) — going to 0.0 is 100% relative degradation
+        # but only 0.017 absolute change, which is below the 0.3 threshold
+        baseline = ExperimentResult(
+            experiment_id="base", description="base",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.7, "guard": 0.017})
+                for i in range(5)
+            ],
+        )
+        candidate = ExperimentResult(
+            experiment_id="cand", description="cand",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.9, "guard": 0.0})
+                for i in range(5)
+            ],
+        )
+
+        decision = evaluate_experiment(baseline, candidate, specs)
+        # Should NOT trigger guard violation — absolute change (0.017) < threshold (0.3)
+        assert len(decision.guard_violations) == 0
+        assert decision.keep  # Primary improved, guard is fine
+
+    def test_guard_floor_real_violation(self):
+        """Guard floor still catches genuinely large absolute drops."""
+        specs = [
+            MetricSpec("primary", MetricRole.PRIMARY, MetricDirection.HIGHER),
+            MetricSpec("guard", MetricRole.GUARD, MetricDirection.HIGHER, guard_threshold=0.1),
+        ]
+        # Guard baseline is near zero, but candidate is much WORSE (large absolute drop)
+        baseline = ExperimentResult(
+            experiment_id="base", description="base",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.7, "guard": 0.03})
+                for i in range(5)
+            ],
+        )
+        candidate = ExperimentResult(
+            experiment_id="cand", description="cand",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.9, "guard": -0.2})
+                for i in range(5)
+            ],
+        )
+
+        decision = evaluate_experiment(baseline, candidate, specs)
+        # absolute change = 0.03 - (-0.2) = 0.23 > threshold 0.1 → SHOULD trigger
+        assert len(decision.guard_violations) > 0
+        assert not decision.keep

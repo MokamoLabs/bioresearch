@@ -14,6 +14,20 @@ class TestPerturbationDomain:
         assert len(dataset.val_idx) > 0
         assert len(dataset.test_idx) > 0
 
+    def test_synthetic_has_cell_type_diversity(self):
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        unique_types = set(dataset.cell_types)
+        assert len(unique_types) >= 2  # K562 and HeLa
+
+    def test_synthetic_degs_computed_from_effects(self):
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        # DEGs should be computed from actual expression differences
+        for pname, degs in dataset.deg_indices.items():
+            assert len(degs) > 0
+            assert len(degs) <= 20  # N_TOP_DEGS
+
     def test_no_split_overlap(self):
         from domains.perturbation.prepare import load_data
         dataset = load_data("synthetic")

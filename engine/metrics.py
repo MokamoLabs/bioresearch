@@ -279,11 +279,25 @@ def evaluate_experiment(
         if spec.role == MetricRole.PRIMARY:
             primary_comparisons.append(comp)
         elif spec.role == MetricRole.GUARD:
-            degradation = spec.degradation_fraction(comp.candidate_mean, comp.baseline_mean)
             threshold = spec.guard_threshold or 0.1
-            if degradation > threshold:
+            baseline_val = comp.baseline_mean
+            candidate_val = comp.candidate_mean
+
+            # When baseline is near zero, relative degradation is meaningless.
+            # Switch to absolute change threshold to avoid false guard violations.
+            GUARD_FLOOR = 0.05
+            if abs(baseline_val) < GUARD_FLOOR:
+                if spec.direction == MetricDirection.HIGHER:
+                    violation = (baseline_val - candidate_val) > threshold
+                else:
+                    violation = (candidate_val - baseline_val) > threshold
+            else:
+                degradation = spec.degradation_fraction(candidate_val, baseline_val)
+                violation = degradation > threshold
+
+            if violation:
                 guard_violations.append(
-                    f"{spec.name}: degraded by {degradation:.1%} (threshold: {threshold:.1%})"
+                    f"{spec.name}: degraded (baseline={baseline_val:.4f}, candidate={candidate_val:.4f}, threshold={threshold:.1%})"
                 )
 
     if guard_violations:

@@ -43,10 +43,13 @@ You have access to these biological priors (via `knowledge.retrieval.BioKnowledg
 | drug_target | D×N | Drug binding data (ChEMBL) |
 
 ## Strategy Guidelines
-1. Start simple. The linear baseline is surprisingly strong.
-2. Try incorporating one biological prior at a time.
-3. Graph-based approaches (GNN on PPI) are natural for this domain.
-4. Attention over genes conditioned on perturbation identity is worth trying.
-5. Regularization matters more than architecture complexity.
-6. Cross-perturbation transfer learning (shared low-rank representations) could help.
-7. Don't overfit to training perturbations — generalization to unseen perturbations is key.
+1. The data has realistic complexity: gene pathway correlations, expression-dependent
+   perturbation effects, and cell-type-specific responses.
+2. The linear baseline misses nonlinear effects and cell-type differences — exploit these.
+3. Try MLP/neural approaches for nonlinear expression-to-delta mapping.
+4. Condition on cell type (available in `dataset.cell_types`) for better predictions.
+5. Gene pathway structure means perturbation effects propagate — model secondary effects.
+6. For unseen perturbations, pathway-based transfer learning beats `global_mean_delta`.
+7. Don't get stuck on regularization variants — if 3 attempts fail, switch approach families.
+8. Attention over genes conditioned on perturbation identity is worth trying.
+9. Don't overfit to training perturbations — generalization to unseen perturbations is key.

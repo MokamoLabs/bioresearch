@@ -46,7 +46,7 @@ class OrchestratorConfig:
     train_file: str = "train.py"
     program_file: str = "program.md"
     max_prompt_tokens: int = 100000  # approximate budget for the prompt
-    max_history_items: int = 15
+    max_history_items: int = 50
     backend: str = "anthropic"  # "anthropic" or "vertex"
     vertex_project_id: str = ""
     vertex_region: str = "global"
@@ -174,6 +174,14 @@ class Orchestrator:
 8. The code must be complete and runnable. Do not use placeholders or TODOs.
 9. Preserve the output format: metrics must be printed as JSON on the last line of stdout.
 10. Keep the seed-controlled training subsample logic (rng = np.random.RandomState(SEED); subsample 90% of training data). This ensures meaningful statistical evaluation.
+
+## Exploration Strategy
+- Track what you've tried. Avoid repeating the same family of approaches.
+- If regularization variants haven't worked after 3 attempts, switch to a completely different direction.
+- The data has gene pathway structure, expression-dependent effects, and cell-type-specific responses.
+  Models that capture these patterns will outperform the linear baseline.
+- Consider: MLP for nonlinear expression-delta mapping, cell-type conditioning,
+  pathway-aware features, attention over genes, ensemble methods.
 """
 
     def _format_metric_specs(self) -> str:
@@ -190,6 +198,28 @@ class Orchestrator:
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for code/English."""
         return len(text) // 4
+
+    def _categorize_experiments(self, history: list) -> dict[str, list[str]]:
+        """Group experiments by approach category based on description keywords."""
+        categories: dict[str, list[str]] = {}
+        for rec in history:
+            desc = rec.description.lower()
+            if any(w in desc for w in ["shrink", "ridge", "regulariz", "l1", "l2", "weight decay", "dropout"]):
+                cat = "regularization"
+            elif any(w in desc for w in ["neural", "mlp", "hidden", "layer", "deep", "nonlinear"]):
+                cat = "neural_network"
+            elif any(w in desc for w in ["attention", "transformer", "self-attention"]):
+                cat = "attention"
+            elif any(w in desc for w in ["ensemble", "bagging", "boost", "averaging"]):
+                cat = "ensemble"
+            elif any(w in desc for w in ["graph", "gnn", "network", "pathway"]):
+                cat = "graph"
+            elif any(w in desc for w in ["feature", "engineer", "augment", "cell type", "cell-type"]):
+                cat = "feature_engineering"
+            else:
+                cat = "other"
+            categories.setdefault(cat, []).append(rec.status)
+        return categories
 
     def build_user_prompt(self, context: AgentContext) -> str:
         parts = []
@@ -224,14 +254,15 @@ class Orchestrator:
             parts.append(dec_section)
             token_budget -= self._estimate_tokens(dec_section)
 
-        # Experiment history (adaptive — include as many as fit)
+        # Experiment history (adaptive — include as many as fit, with reasons)
         if context.experiment_history and token_budget > 500:
             history_lines = ["\n## Recent Experiment History"]
             max_items = min(self.config.max_history_items, len(context.experiment_history))
             recent = context.experiment_history[-max_items:]
             for rec in recent:
                 metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in rec.metrics.items())
-                line = f"- [{rec.status}] {rec.description[:100]} | {metrics_str}"
+                reason_str = f" | Reason: {rec.decision_reason[:80]}" if rec.decision_reason else ""
+                line = f"- [{rec.status}] {rec.description[:100]} | {metrics_str}{reason_str}"
                 line_tokens = self._estimate_tokens(line)
                 if token_budget - line_tokens < 200:
                     break
@@ -239,6 +270,43 @@ class Orchestrator:
                 token_budget -= line_tokens
             if len(history_lines) > 1:
                 parts.append("\n".join(history_lines))
+
+        # Approach categorization and diversity nudge
+        if context.experiment_history and token_budget > 500:
+            categories = self._categorize_experiments(context.experiment_history)
+            if categories:
+                cat_lines = ["\n## Tried Approach Categories"]
+                for cat, statuses in sorted(categories.items()):
+                    kept = statuses.count("keep")
+                    reverted = statuses.count("revert")
+                    cat_lines.append(f"- {cat}: {len(statuses)} attempts ({kept} kept, {reverted} reverted)")
+                all_categories = {"regularization", "neural_network", "attention", "ensemble", "graph", "feature_engineering"}
+                unexplored = all_categories - set(categories.keys())
+                if unexplored:
+                    cat_lines.append(f"-> Consider unexplored categories: {', '.join(sorted(unexplored))}")
+                cat_section = "\n".join(cat_lines)
+                parts.append(cat_section)
+                token_budget -= self._estimate_tokens(cat_section)
+
+            # Diversity instruction after consecutive reverts
+            recent_reverts = 0
+            for rec in reversed(context.experiment_history):
+                if rec.status == "revert":
+                    recent_reverts += 1
+                else:
+                    break
+            if recent_reverts >= 5:
+                parts.append(
+                    f"\n## IMPORTANT: Diversity Required\n"
+                    f"The last {recent_reverts} experiments were all reverted. "
+                    "You MUST try a fundamentally different approach. Consider:\n"
+                    "- A completely different model architecture (MLP, attention, GNN)\n"
+                    "- Using biological knowledge priors\n"
+                    "- Novel feature engineering (gene interactions, pathway features)\n"
+                    "- Conditioning on cell type metadata\n"
+                    "- Ensemble methods\n"
+                    "Do NOT try another variation of regularization or shrinkage."
+                )
 
         parts.append(
             "\nNow propose your next modification to train.py. "

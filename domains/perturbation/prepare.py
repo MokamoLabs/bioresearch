@@ -117,55 +117,136 @@ def load_data(dataset_name: str = "norman_2019", n_genes: int = N_GENES) -> Pert
 
 
 def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_pert: int = 50) -> PerturbationDataset:
-    """Create a small synthetic dataset for testing. Uses DATA_SEED (fixed) for reproducibility across experiment seeds."""
+    """
+    Create a synthetic dataset with biologically realistic complexity.
+
+    Uses DATA_SEED (fixed) for reproducibility across experiment seeds.
+    Includes four layers of complexity that create headroom for smarter models:
+    1. Gene pathway structure (correlated genes, secondary effects)
+    2. Expression-dependent modulation (nonlinear ctrl→effect mapping)
+    3. Cell-type-specific responses (K562 vs HeLa scale differently)
+    4. Shared perturbation structure (pathway-level shared effects)
+    """
     rng = np.random.RandomState(DATA_SEED)
     n_samples = n_perts * n_cells_per_pert
 
-    # Generate control expression
-    gene_means = rng.exponential(1.0, n_genes)
-    ctrl_expr = rng.poisson(gene_means, (n_samples, n_genes)).astype(np.float32)
+    # --- Pathway structure ---
+    n_pathways = min(8, max(2, n_genes // 12))
+    gene_pathway = np.zeros(n_genes, dtype=int)
+    perm = rng.permutation(n_genes)
+    for i, gene_idx in enumerate(perm):
+        gene_pathway[gene_idx] = i % n_pathways
 
-    # Generate perturbation effects
+    # Pathway-level shared effects: perturbations hitting the same pathway share a component
+    pathway_shared_effects = {}
+    for pw in range(n_pathways):
+        pathway_shared_effects[pw] = rng.randn(n_genes) * 0.5
+
+    # --- Generate control expression with pathway-correlated structure ---
+    gene_means = rng.exponential(1.5, n_genes)
+    # Add pathway-level correlation: genes in the same pathway share a baseline offset
+    pathway_offsets = rng.randn(n_pathways) * 0.5
+    for g in range(n_genes):
+        gene_means[g] += abs(pathway_offsets[gene_pathway[g]])
+
+    ctrl_expr = rng.poisson(np.maximum(gene_means, 0.1), (n_samples, n_genes)).astype(np.float32)
+
+    # --- Cell type assignments (deterministic per cell) ---
+    cell_types_list = []
+    for p in range(n_perts):
+        for c in range(n_cells_per_pert):
+            cell_types_list.append("K562" if rng.rand() > 0.3 else "HeLa")
+    cell_type_scale = {"K562": 1.0, "HeLa": 0.6}
+
+    # --- Generate perturbation effects with all four complexity layers ---
     pert_names_list = []
     pert_types_list = []
-    cell_types_list = []
-    pert_expr = np.zeros_like(ctrl_expr)
-    deg_indices = {}
+    pert_expr = ctrl_expr.copy()
 
     for p in range(n_perts):
         start = p * n_cells_per_pert
         end = start + n_cells_per_pert
         pname = f"PERT_{p:03d}"
 
-        # Each perturbation affects a random subset of genes
-        n_affected = rng.randint(5, min(30, n_genes))
-        affected = rng.choice(n_genes, n_affected, replace=False)
-        effect = rng.randn(n_affected) * 2.0
+        # Primary affected genes (direct targets)
+        n_primary = rng.randint(3, min(15, n_genes))
+        primary_genes = rng.choice(n_genes, n_primary, replace=False)
+        primary_effect = rng.randn(n_primary) * 2.0
 
-        pert_expr[start:end] = ctrl_expr[start:end].copy()
-        pert_expr[start:end, affected] += effect
+        # Secondary affected genes: other genes in the same pathways as primary targets
+        primary_pathways = set(gene_pathway[g] for g in primary_genes)
+        secondary_genes = []
+        for g in range(n_genes):
+            if g not in primary_genes and gene_pathway[g] in primary_pathways:
+                secondary_genes.append(g)
+        secondary_genes = np.array(secondary_genes, dtype=int)
 
-        deg_indices[pname] = affected[:N_TOP_DEGS] if len(affected) >= N_TOP_DEGS else affected
+        # Secondary effects: propagated from primary, dampened by 0.3x
+        secondary_effect = np.zeros(len(secondary_genes))
+        if len(secondary_genes) > 0:
+            for sg_idx, sg in enumerate(secondary_genes):
+                pw = gene_pathway[sg]
+                # Average primary effect within this pathway
+                pw_primary_mask = [gene_pathway[pg] == pw for pg in primary_genes]
+                if any(pw_primary_mask):
+                    pw_effects = primary_effect[pw_primary_mask]
+                    secondary_effect[sg_idx] = np.mean(pw_effects) * 0.3
+
+        # Shared pathway component
+        primary_pw = gene_pathway[primary_genes[0]]
+        shared_component_primary = pathway_shared_effects[primary_pw][primary_genes] * 0.4
+        shared_component_secondary = np.zeros(len(secondary_genes))
+        if len(secondary_genes) > 0:
+            shared_component_secondary = pathway_shared_effects[primary_pw][secondary_genes] * 0.2
+
+        # Apply effects per cell with expression-dependent modulation and cell-type scaling
+        for cell_idx in range(start, end):
+            ct = cell_types_list[cell_idx]
+            ct_scale = cell_type_scale[ct]
+
+            # Expression-dependent modulation for primary genes
+            ctrl_vals = ctrl_expr[cell_idx, primary_genes]
+            modulation = 1.0 + 0.5 * np.tanh(
+                (ctrl_vals - gene_means[primary_genes]) / (gene_means[primary_genes] + 1e-6)
+            )
+            total_primary = (primary_effect + shared_component_primary) * modulation * ct_scale
+            pert_expr[cell_idx, primary_genes] += total_primary
+
+            # Secondary effects (also modulated, but less strongly)
+            if len(secondary_genes) > 0:
+                ctrl_sec = ctrl_expr[cell_idx, secondary_genes]
+                mod_sec = 1.0 + 0.3 * np.tanh(
+                    (ctrl_sec - gene_means[secondary_genes]) / (gene_means[secondary_genes] + 1e-6)
+                )
+                total_secondary = (secondary_effect + shared_component_secondary) * mod_sec * ct_scale
+                pert_expr[cell_idx, secondary_genes] += total_secondary
+
+            # Add per-cell noise
+            all_affected = np.concatenate([primary_genes, secondary_genes])
+            noise = rng.randn(len(all_affected)) * 0.3
+            pert_expr[cell_idx, all_affected] += noise
 
         for _ in range(n_cells_per_pert):
             pert_names_list.append(pname)
             pert_types_list.append("gene")
-            cell_types_list.append("K562" if rng.rand() > 0.3 else "HeLa")
 
     gene_names = [f"GENE_{i:04d}" for i in range(n_genes)]
 
+    # Compute DEGs from actual perturbation effects (not hard-coded)
+    deg_indices = _compute_degs(ctrl_expr, pert_expr, pert_names_list, n_top=N_TOP_DEGS)
+
     # Split by perturbation (not by cell)
-    unique_perts = list(set(pert_names_list))
-    rng.shuffle(unique_perts)
+    unique_perts = sorted(set(pert_names_list))
+    rng2 = np.random.RandomState(DATA_SEED)
+    rng2.shuffle(unique_perts)
     n_train = int(len(unique_perts) * TRAIN_SPLIT)
     n_val = int(len(unique_perts) * VAL_SPLIT)
     train_perts = set(unique_perts[:n_train])
     val_perts = set(unique_perts[n_train:n_train + n_val])
-    test_perts = set(unique_perts[n_train + n_val:])
 
     train_idx = np.array([i for i, p in enumerate(pert_names_list) if p in train_perts])
     val_idx = np.array([i for i, p in enumerate(pert_names_list) if p in val_perts])
-    test_idx = np.array([i for i, p in enumerate(pert_names_list) if p in test_perts])
+    test_idx = np.array([i for i, p in enumerate(pert_names_list) if p not in train_perts and p not in val_perts])
 
     return PerturbationDataset(
         ctrl_expr=ctrl_expr,

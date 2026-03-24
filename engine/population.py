@@ -34,8 +34,8 @@ class PopulationConfig:
     num_seeds: int = 5
     max_iterations: int = 100
     min_seeds_for_decision: int = 3
-    alpha: float = 0.05
-    min_effect_size: float = 0.3
+    alpha: float = 0.10
+    min_effect_size: float = 0.15
     time_budget_per_seed: int = 600
     orchestrator_config: Optional[OrchestratorConfig] = None
 
@@ -180,6 +180,7 @@ class PopulationSearch:
                 alpha=self.config.alpha,
                 min_effect_size=self.config.min_effect_size,
                 min_seeds=self.config.min_seeds_for_decision,
+                paired=True,
             )
 
             action = "KEEP" if decision.keep else "REVERT"
