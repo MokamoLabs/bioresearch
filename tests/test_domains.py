@@ -28,7 +28,7 @@ class TestPerturbationDomain:
             assert len(degs) > 0
             assert len(degs) <= 20  # N_TOP_DEGS
 
-    def test_no_split_overlap(self):
+    def test_no_cell_index_overlap(self):
         from domains.perturbation.prepare import load_data
         dataset = load_data("synthetic")
         train = set(dataset.train_idx)
@@ -37,6 +37,54 @@ class TestPerturbationDomain:
         assert len(train & val) == 0
         assert len(train & test) == 0
         assert len(val & test) == 0
+
+    def test_hybrid_split_has_seen_and_unseen(self):
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        train_perts = set(dataset.pert_names[i] for i in dataset.train_idx)
+        val_perts = set(dataset.pert_names[i] for i in dataset.val_idx)
+        test_perts = set(dataset.pert_names[i] for i in dataset.test_idx)
+
+        # Some perturbations should appear in both train and val/test (seen-split)
+        seen_in_val = train_perts & val_perts
+        seen_in_test = train_perts & test_perts
+        assert len(seen_in_val) > 0 or len(seen_in_test) > 0, "No seen-split perturbations found"
+
+        # Some perturbations should be unseen (only in val/test)
+        unseen_val = val_perts - train_perts
+        unseen_test = test_perts - train_perts
+        assert len(unseen_val) > 0 or len(unseen_test) > 0, "No unseen perturbations found"
+
+    def test_perturbation_features_exist(self):
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        assert len(dataset.pert_features) > 0
+        for pname, features in dataset.pert_features.items():
+            assert "target_genes" in features
+            assert "pathway" in features
+            assert len(features["target_genes"]) > 0
+            assert 0 <= features["pathway"] < dataset.n_pathways
+
+    def test_gene_pathway_info(self):
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        assert dataset.gene_pathway is not None
+        assert len(dataset.gene_pathway) == dataset.n_genes
+        assert dataset.n_pathways > 0
+        # All pathway IDs should be valid
+        assert all(0 <= p < dataset.n_pathways for p in dataset.gene_pathway)
+
+    def test_unseen_perts_have_features(self):
+        """Unseen perturbations should have features available for generalization."""
+        from domains.perturbation.prepare import load_data
+        dataset = load_data("synthetic")
+        train_perts = set(dataset.pert_names[i] for i in dataset.train_idx)
+        val_perts = set(dataset.pert_names[i] for i in dataset.val_idx)
+        test_perts = set(dataset.pert_names[i] for i in dataset.test_idx)
+
+        unseen = (val_perts | test_perts) - train_perts
+        for pname in unseen:
+            assert pname in dataset.pert_features, f"Unseen pert {pname} missing features"
 
     def test_evaluate_returns_correct_keys(self):
         from domains.perturbation.prepare import load_data, evaluate
@@ -52,14 +100,33 @@ class TestPerturbationDomain:
         assert "mse_top20_deg" in metrics
         assert "pearson_all" in metrics
 
+    def test_delta_based_pearson(self):
+        """pearson_deg should measure delta correlation, not absolute expression."""
+        from domains.perturbation.prepare import load_data, evaluate
+        dataset = load_data("synthetic")
+        test_ctrl = dataset.ctrl_expr[dataset.test_idx]
+        test_truth = dataset.pert_expr[dataset.test_idx]
+        test_names = [dataset.pert_names[i] for i in dataset.test_idx]
+
+        # Zero-delta prediction (just ctrl) should give low/zero pearson_deg
+        metrics_zero = evaluate(test_ctrl, test_truth, test_names, dataset.deg_indices,
+                                ctrl_expr=test_ctrl)
+        # Without ctrl_expr, falls back to absolute values (higher)
+        metrics_abs = evaluate(test_ctrl, test_truth, test_names, dataset.deg_indices)
+
+        # Delta-based (with ctrl_expr) should be lower than absolute (without ctrl_expr)
+        # for zero-delta predictions, because ctrl expression inflates absolute pearson
+        assert metrics_zero["pearson_deg"] < metrics_abs["pearson_deg"] or metrics_zero["pearson_deg"] == 0.0
+
     def test_perfect_predictions(self):
         from domains.perturbation.prepare import load_data, evaluate
         dataset = load_data("synthetic")
         truth = dataset.pert_expr[dataset.test_idx]
         names = [dataset.pert_names[i] for i in dataset.test_idx]
+        ctrl = dataset.ctrl_expr[dataset.test_idx]
 
         # Perfect predictions should give high pearson
-        metrics = evaluate(truth, truth, names, dataset.deg_indices)
+        metrics = evaluate(truth, truth, names, dataset.deg_indices, ctrl_expr=ctrl)
         assert metrics["pearson_deg"] > 0.99 or metrics["pearson_deg"] == 0.0  # 0.0 if std=0
         assert metrics["mse_top20_deg"] < 0.001
 

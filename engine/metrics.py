@@ -314,6 +314,13 @@ def evaluate_experiment(
         for c in primary_comparisons
     )
 
+    # Check for identical output (zero-effect modification)
+    all_identical = all(
+        abs(c.baseline_mean - c.candidate_mean) < 1e-6
+        for c in all_comparisons
+        if c.baseline_mean != 0 or c.candidate_mean != 0
+    )
+
     if not any_primary_improved:
         reasons = []
         for c in primary_comparisons:
@@ -325,9 +332,20 @@ def evaluate_experiment(
             elif not c.is_meaningful:
                 parts.append(f"d={c.effect_size:.3f} < {min_effect_size}")
             reasons.append(f"{c.metric_name}: {', '.join(parts) if parts else 'ok'}")
+
+        reason = f"No primary metric significantly improved: {'; '.join(reasons)}"
+        if all_identical:
+            reason = (
+                "IDENTICAL OUTPUT: candidate produced numerically identical metrics to baseline. "
+                "Your code modification did not change the model's predictions. "
+                "Check for: (1) bugs causing fallback to baseline logic, (2) models that collapse "
+                "to mean delta, (3) unused features. The biggest improvement comes from using "
+                "dataset.pert_features to predict unseen perturbations. | " + reason
+            )
+
         return EvaluationDecision(
             keep=False,
-            reason=f"No primary metric significantly improved: {'; '.join(reasons)}",
+            reason=reason,
             primary_comparisons=primary_comparisons,
             guard_violations=[],
             all_comparisons=all_comparisons,

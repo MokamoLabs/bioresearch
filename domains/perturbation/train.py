@@ -35,16 +35,20 @@ class LinearPerturbModel:
     """
     Linear perturbation prediction model.
 
-    For each perturbation, learns a linear map from control expression
-    to perturbation effect (delta = pert - ctrl).
+    For each seen perturbation, uses the mean delta (pert - ctrl) from training.
+    For unseen perturbations, falls back to the global mean delta.
 
-    This is the baseline that deep learning hasn't beaten (Nature Methods 2025).
+    This baseline does NOT use:
+    - Perturbation features (target genes, pathway) for unseen perts
+    - Expression-dependent modulation (nonlinear ctrl->effect mapping)
+    - Cell-type conditioning
+
+    These are available in the dataset and represent opportunities for improvement.
     """
 
-    def __init__(self, n_genes: int, reg_strength: float = 1.0):
+    def __init__(self, n_genes: int):
         self.n_genes = n_genes
-        self.reg_strength = reg_strength
-        self.pert_embeddings: dict[str, np.ndarray] = {}  # pert_name -> mean delta
+        self.pert_deltas: dict[str, np.ndarray] = {}
         self.global_mean_delta: np.ndarray | None = None
 
     def fit(self, ctrl_expr: np.ndarray, pert_expr: np.ndarray, pert_names: list[str]):
@@ -55,13 +59,13 @@ class LinearPerturbModel:
         for pname in set(pert_names):
             mask = np.array([p == pname for p in pert_names])
             if mask.sum() > 0:
-                self.pert_embeddings[pname] = deltas[mask].mean(axis=0)
+                self.pert_deltas[pname] = deltas[mask].mean(axis=0)
 
     def predict(self, ctrl_expr: np.ndarray, pert_names: list[str]) -> np.ndarray:
         """Predict post-perturbation expression."""
         predictions = np.zeros_like(ctrl_expr)
         for i, pname in enumerate(pert_names):
-            delta = self.pert_embeddings.get(pname, self.global_mean_delta)
+            delta = self.pert_deltas.get(pname, self.global_mean_delta)
             if delta is None:
                 delta = np.zeros(self.n_genes)
             predictions[i] = ctrl_expr[i] + delta
@@ -79,6 +83,12 @@ def main():
     dataset = load_data("synthetic")  # Start with synthetic; change to "norman_2019" for real data
     print(f"Dataset: {dataset.n_samples} samples, {dataset.n_genes} genes")
     print(f"Train: {len(dataset.train_idx)}, Val: {len(dataset.val_idx)}, Test: {len(dataset.test_idx)}")
+
+    # Available but unused by baseline:
+    #   dataset.pert_features  — dict: pert_name -> {"target_genes": ndarray, "pathway": int}
+    #   dataset.gene_pathway   — ndarray: gene_idx -> pathway_id
+    #   dataset.n_pathways     — int: number of pathways
+    #   dataset.cell_types     — list: cell type per sample ("K562" or "HeLa")
 
     # Subsample training data for seed-controlled variance.
     # Each seed uses a 90% random subsample of training data, giving natural

@@ -9,10 +9,10 @@ predict the post-perturbation gene expression profile.
 
 Data: scPerturb (via pertpy) and Tahoe-100M (Arc Institute)
 Metrics:
-    PRIMARY:   pearson_deg     (Pearson r on top-20 DEGs)
-    GUARD:     mse_top20_deg   (MSE on top-20 DEGs, must not degrade >10%)
+    PRIMARY:   pearson_deg     (per-cell Pearson r on top-20 DEGs)
+    GUARD:     mse_top20_deg   (per-cell MSE on top-20 DEGs, must not degrade >10%)
     GUARD:     direction_acc   (up/down direction accuracy, must stay >0.7)
-    BONUS:     cross_context   (generalization gap to unseen cell types)
+    BONUS:     cross_context   (generalization gap across cell types)
     DIAG:      pearson_all, calibration
 """
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +78,12 @@ class PerturbationDataset:
     train_idx: np.ndarray
     val_idx: np.ndarray
     test_idx: np.ndarray
+    # Perturbation features for generalization
+    pert_features: dict[str, dict] = field(default_factory=dict)
+    # pert_name -> {"target_genes": ndarray, "pathway": int}
+    gene_pathway: np.ndarray = field(default_factory=lambda: np.array([]))
+    # gene_idx -> pathway_id
+    n_pathways: int = 0
 
     @property
     def n_genes(self) -> int:
@@ -123,9 +129,17 @@ def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_p
     Uses DATA_SEED (fixed) for reproducibility across experiment seeds.
     Includes four layers of complexity that create headroom for smarter models:
     1. Gene pathway structure (correlated genes, secondary effects)
-    2. Expression-dependent modulation (nonlinear ctrl→effect mapping)
+    2. Expression-dependent modulation (nonlinear ctrl->effect mapping)
     3. Cell-type-specific responses (K562 vs HeLa scale differently)
     4. Shared perturbation structure (pathway-level shared effects)
+
+    Split strategy (hybrid):
+    - 50% perturbations: train-only (all cells in training set)
+    - 20% perturbations: seen-split (cells divided across train/val/test)
+    - 30% perturbations: unseen (all cells in val or test only)
+
+    Perturbation features (target genes, pathway) are provided for ALL
+    perturbations, enabling models to generalize to unseen perturbations.
     """
     rng = np.random.RandomState(DATA_SEED)
     n_samples = n_perts * n_cells_per_pert
@@ -162,6 +176,7 @@ def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_p
     pert_names_list = []
     pert_types_list = []
     pert_expr = ctrl_expr.copy()
+    pert_features = {}  # Store features for generalization
 
     for p in range(n_perts):
         start = p * n_cells_per_pert
@@ -199,6 +214,12 @@ def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_p
         if len(secondary_genes) > 0:
             shared_component_secondary = pathway_shared_effects[primary_pw][secondary_genes] * 0.2
 
+        # Store perturbation features for generalization
+        pert_features[pname] = {
+            "target_genes": primary_genes.copy(),
+            "pathway": int(primary_pw),
+        }
+
         # Apply effects per cell with expression-dependent modulation and cell-type scaling
         for cell_idx in range(start, end):
             ct = cell_types_list[cell_idx]
@@ -235,18 +256,53 @@ def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_p
     # Compute DEGs from actual perturbation effects (not hard-coded)
     deg_indices = _compute_degs(ctrl_expr, pert_expr, pert_names_list, n_top=N_TOP_DEGS)
 
-    # Split by perturbation (not by cell)
+    # --- Hybrid split ---
+    # 50% train-only, 20% seen-split (cells divided), 30% unseen (val/test only)
     unique_perts = sorted(set(pert_names_list))
     rng2 = np.random.RandomState(DATA_SEED)
     rng2.shuffle(unique_perts)
-    n_train = int(len(unique_perts) * TRAIN_SPLIT)
-    n_val = int(len(unique_perts) * VAL_SPLIT)
-    train_perts = set(unique_perts[:n_train])
-    val_perts = set(unique_perts[n_train:n_train + n_val])
 
-    train_idx = np.array([i for i, p in enumerate(pert_names_list) if p in train_perts])
-    val_idx = np.array([i for i, p in enumerate(pert_names_list) if p in val_perts])
-    test_idx = np.array([i for i, p in enumerate(pert_names_list) if p not in train_perts and p not in val_perts])
+    n_train_only = int(len(unique_perts) * 0.5)   # 10 perts
+    n_seen_split = int(len(unique_perts) * 0.2)    # 4 perts
+    # remaining: unseen perts split between val and test
+
+    train_only_perts = set(unique_perts[:n_train_only])
+    seen_split_perts = list(unique_perts[n_train_only:n_train_only + n_seen_split])
+    unseen_perts = unique_perts[n_train_only + n_seen_split:]
+    n_val_unseen = len(unseen_perts) // 2
+    val_unseen_perts = set(unseen_perts[:n_val_unseen])
+    test_unseen_perts = set(unseen_perts[n_val_unseen:])
+
+    train_idx = []
+    val_idx = []
+    test_idx = []
+
+    # Train-only perturbations: all cells go to train
+    for i, pname in enumerate(pert_names_list):
+        if pname in train_only_perts:
+            train_idx.append(i)
+
+    # Seen-split perturbations: cells divided 70/15/15
+    for pname in seen_split_perts:
+        pert_cell_indices = [i for i, p in enumerate(pert_names_list) if p == pname]
+        rng2.shuffle(pert_cell_indices)
+        n = len(pert_cell_indices)
+        n_tr = int(n * 0.7)
+        n_va = int(n * 0.15)
+        train_idx.extend(pert_cell_indices[:n_tr])
+        val_idx.extend(pert_cell_indices[n_tr:n_tr + n_va])
+        test_idx.extend(pert_cell_indices[n_tr + n_va:])
+
+    # Unseen perturbations: all cells go to val or test
+    for i, pname in enumerate(pert_names_list):
+        if pname in val_unseen_perts:
+            val_idx.append(i)
+        elif pname in test_unseen_perts:
+            test_idx.append(i)
+
+    train_idx = np.array(sorted(train_idx))
+    val_idx = np.array(sorted(val_idx))
+    test_idx = np.array(sorted(test_idx))
 
     return PerturbationDataset(
         ctrl_expr=ctrl_expr,
@@ -259,6 +315,9 @@ def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_p
         train_idx=train_idx,
         val_idx=val_idx,
         test_idx=test_idx,
+        pert_features=pert_features,
+        gene_pathway=gene_pathway,
+        n_pathways=n_pathways,
     )
 
 
@@ -358,6 +417,15 @@ def _compute_degs(
 def _save_cached(dataset: PerturbationDataset, path: Path):
     """Save processed dataset to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Serialize pert_features: convert ndarray values to lists for JSON
+    pf_serializable = {}
+    for pname, feats in dataset.pert_features.items():
+        pf_serializable[pname] = {
+            "target_genes": feats["target_genes"].tolist() if isinstance(feats["target_genes"], np.ndarray) else feats["target_genes"],
+            "pathway": int(feats["pathway"]),
+        }
+
     np.savez_compressed(
         path,
         ctrl_expr=dataset.ctrl_expr,
@@ -370,6 +438,9 @@ def _save_cached(dataset: PerturbationDataset, path: Path):
         val_idx=dataset.val_idx,
         test_idx=dataset.test_idx,
         deg_indices_json=json.dumps({k: v.tolist() for k, v in dataset.deg_indices.items()}),
+        pert_features_json=json.dumps(pf_serializable),
+        gene_pathway=dataset.gene_pathway,
+        n_pathways=np.array([dataset.n_pathways]),
     )
     print(f"Cached processed dataset to {path}")
 
@@ -378,6 +449,20 @@ def _load_cached(path: Path) -> PerturbationDataset:
     """Load cached processed dataset."""
     data = np.load(path, allow_pickle=True)
     deg_indices = {k: np.array(v) for k, v in json.loads(str(data["deg_indices_json"])).items()}
+
+    # Load perturbation features if available
+    pert_features = {}
+    if "pert_features_json" in data:
+        pf_raw = json.loads(str(data["pert_features_json"]))
+        for pname, feats in pf_raw.items():
+            pert_features[pname] = {
+                "target_genes": np.array(feats["target_genes"]),
+                "pathway": feats["pathway"],
+            }
+
+    gene_pathway = data["gene_pathway"] if "gene_pathway" in data else np.array([])
+    n_pathways = int(data["n_pathways"][0]) if "n_pathways" in data else 0
+
     return PerturbationDataset(
         ctrl_expr=data["ctrl_expr"],
         pert_expr=data["pert_expr"],
@@ -389,6 +474,9 @@ def _load_cached(path: Path) -> PerturbationDataset:
         train_idx=data["train_idx"],
         val_idx=data["val_idx"],
         test_idx=data["test_idx"],
+        pert_features=pert_features,
+        gene_pathway=gene_pathway,
+        n_pathways=n_pathways,
     )
 
 
@@ -407,6 +495,10 @@ def evaluate(
     """
     Evaluate perturbation predictions.
 
+    All DEG metrics are computed PER-CELL then averaged. This means models
+    that capture cell-level variation (expression-dependent effects, cell-type
+    conditioning) are properly rewarded.
+
     Args:
         predictions: Predicted post-perturbation expression (n_samples x n_genes)
         ground_truth: True post-perturbation expression (n_samples x n_genes)
@@ -420,7 +512,9 @@ def evaluate(
     """
     metrics = {}
 
-    # 1. Pearson correlation on top-20 DEGs (PRIMARY)
+    # 1. Per-cell Pearson on DELTA (predicted effect vs true effect) on top-20 DEGs (PRIMARY)
+    # This measures whether the model captures the perturbation effect pattern,
+    # not just the baseline expression. ctrl_expr is required for delta computation.
     pearson_degs = []
     for pname in set(pert_names):
         if pname not in deg_indices:
@@ -430,18 +524,22 @@ def evaluate(
         if len(degs) == 0:
             continue
 
-        pred_mean = predictions[mask][:, degs].mean(axis=0)
-        true_mean = ground_truth[mask][:, degs].mean(axis=0)
-
-        if np.std(pred_mean) < 1e-10 or np.std(true_mean) < 1e-10:
-            continue
-        r = np.corrcoef(pred_mean, true_mean)[0, 1]
-        if not np.isnan(r):
-            pearson_degs.append(r)
+        for i in np.where(mask)[0]:
+            if ctrl_expr is not None:
+                pred_delta = predictions[i, degs] - ctrl_expr[i, degs]
+                true_delta = ground_truth[i, degs] - ctrl_expr[i, degs]
+            else:
+                pred_delta = predictions[i, degs]
+                true_delta = ground_truth[i, degs]
+            if np.std(pred_delta) < 1e-10 or np.std(true_delta) < 1e-10:
+                continue
+            r = np.corrcoef(pred_delta, true_delta)[0, 1]
+            if not np.isnan(r):
+                pearson_degs.append(r)
 
     metrics["pearson_deg"] = float(np.mean(pearson_degs)) if pearson_degs else 0.0
 
-    # 2. MSE on top-20 DEGs (GUARD)
+    # 2. Per-cell MSE on top-20 DEGs (GUARD)
     mse_degs = []
     for pname in set(pert_names):
         if pname not in deg_indices:
@@ -451,10 +549,9 @@ def evaluate(
         if len(degs) == 0:
             continue
 
-        pred_mean = predictions[mask][:, degs].mean(axis=0)
-        true_mean = ground_truth[mask][:, degs].mean(axis=0)
-        mse = np.mean((pred_mean - true_mean) ** 2)
-        mse_degs.append(mse)
+        for i in np.where(mask)[0]:
+            mse = float(np.mean((predictions[i, degs] - ground_truth[i, degs]) ** 2))
+            mse_degs.append(mse)
 
     metrics["mse_top20_deg"] = float(np.mean(mse_degs)) if mse_degs else float("inf")
 
@@ -469,6 +566,7 @@ def evaluate(
             if len(degs) == 0:
                 continue
 
+            # Per-perturbation direction accuracy (averaged over cells would be too noisy)
             ctrl_mean = ctrl_expr[mask][:, degs].mean(axis=0)
             pred_mean = predictions[mask][:, degs].mean(axis=0)
             true_mean = ground_truth[mask][:, degs].mean(axis=0)
@@ -533,8 +631,21 @@ if __name__ == "__main__":
     dataset = load_data("synthetic")
     print(f"Dataset: {dataset.n_samples} samples, {dataset.n_genes} genes")
     print(f"Train: {len(dataset.train_idx)}, Val: {len(dataset.val_idx)}, Test: {len(dataset.test_idx)}")
+    print(f"Perturbation features: {len(dataset.pert_features)} perturbations")
+    print(f"Gene pathways: {dataset.n_pathways} pathways")
 
-    # Test evaluation with random predictions
+    # Show split composition
+    train_perts = set(dataset.pert_names[i] for i in dataset.train_idx)
+    val_perts = set(dataset.pert_names[i] for i in dataset.val_idx)
+    test_perts = set(dataset.pert_names[i] for i in dataset.test_idx)
+    seen_val = train_perts & val_perts
+    seen_test = train_perts & test_perts
+    unseen_val = val_perts - train_perts
+    unseen_test = test_perts - train_perts
+    print(f"Val: {len(seen_val)} seen perts + {len(unseen_val)} unseen perts")
+    print(f"Test: {len(seen_test)} seen perts + {len(unseen_test)} unseen perts")
+
+    # Test evaluation with baseline predictions
     rng = np.random.RandomState(42)
     predictions = dataset.ctrl_expr + rng.randn(*dataset.pert_expr.shape) * 0.1
     metrics = evaluate(

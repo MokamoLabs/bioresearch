@@ -148,6 +148,7 @@ class Orchestrator:
     def build_system_prompt(self) -> str:
         program = self._read_file(self.program_path)
         metric_desc = self._format_metric_specs()
+        prepare_code = self._read_file(self.domain_dir / "prepare.py")
 
         return f"""You are an autonomous biology ML researcher. Your job is to modify train.py to improve the model's performance on the evaluation metrics.
 
@@ -182,6 +183,12 @@ class Orchestrator:
   Models that capture these patterns will outperform the linear baseline.
 - Consider: MLP for nonlinear expression-delta mapping, cell-type conditioning,
   pathway-aware features, attention over genes, ensemble methods.
+
+## Evaluation Code (READ-ONLY reference — do NOT modify prepare.py)
+Study this to understand the data structure, split strategy, and how metrics are computed:
+```python
+{prepare_code}
+```
 """
 
     def _format_metric_specs(self) -> str:

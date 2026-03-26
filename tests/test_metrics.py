@@ -350,3 +350,25 @@ class TestEvaluateExperiment:
         # absolute change = 0.03 - (-0.2) = 0.23 > threshold 0.1 → SHOULD trigger
         assert len(decision.guard_violations) > 0
         assert not decision.keep
+
+    def test_identical_output_detection(self):
+        """When candidate metrics are identical to baseline, reason should flag it."""
+        specs = [MetricSpec("primary", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        baseline = ExperimentResult(
+            experiment_id="base", description="base",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.5})
+                for i in range(5)
+            ],
+        )
+        candidate = ExperimentResult(
+            experiment_id="cand", description="cand",
+            seed_results=[
+                SeedResult(seed=i, metrics={"primary": 0.5})  # identical
+                for i in range(5)
+            ],
+        )
+
+        decision = evaluate_experiment(baseline, candidate, specs)
+        assert not decision.keep
+        assert "IDENTICAL OUTPUT" in decision.reason
