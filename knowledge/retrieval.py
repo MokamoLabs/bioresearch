@@ -1,15 +1,30 @@
 """
-BioKnowledge: gene/drug/disease embeddings and biological priors.
+BioKnowledge: honest access to EXTERNAL biological priors.
 
-Provides a unified API for retrieving biological knowledge that the agent
-can use to inform its architecture decisions.
+History: this module previously advertised six impressive sources (GPT-4 gene embeddings,
+ESM-2 structure, STRING PPI, Reactome pathways, ChEMBL drug-target) whose data was, in
+fact, `numpy.random.randn` produced by knowledge/precompute.py — and keyed to gene names
+that did not even match the datasets. It injected noise into the agent prompt while lending
+false biological credibility.
+
+This rewrite is honest by construction:
+  * Nothing is fabricated. A source exists only if a real, self-describing `.npz` file is
+    present on disk (or is registered in-process from real data via `register_source`).
+  * Coverage is measured against the actual query genes. A source that does not cover a
+    task's gene identifiers is NOT advertised to the agent.
+  * With no real sources configured (the default, and the only honest state for the
+    synthetic tasks whose gene ids have no external biology), the packet says so plainly
+    and points the model at the real structure already inside the dataset.
+
+Real-source file format (`.npz`): keys `data` (or `embeddings`/`matrix`), `index`
+(dict entity->row), and optionally `description` (str). Build them with
+knowledge/precompute.py or register them at runtime for real-data campaigns.
 """
 
 from __future__ import annotations
 
 import os
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -20,165 +35,121 @@ import numpy as np
 class KnowledgeSource:
     name: str
     description: str
-    dims: int
-    path: str  # path to pre-computed embeddings
-    loaded: bool = False
+    path: str = ""
     data: Optional[np.ndarray] = None
-    index: Optional[dict[str, int]] = None  # entity name -> row index
+    index: Optional[dict] = None       # entity name -> row index
+    loaded: bool = False
 
 
 class BioKnowledge:
-    """
-    Unified biological knowledge retrieval.
-
-    Supports multiple knowledge sources:
-    - Gene text embeddings (from GPT-4 descriptions)
-    - Gene Ontology graph embeddings
-    - PPI network (STRING database)
-    - Pathway membership (Reactome)
-    - Protein structure embeddings (ESM)
-    - Drug-target affinity (ChEMBL)
-    """
+    """Honest registry of real external biological knowledge sources."""
 
     DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/bioresearch/knowledge")
 
     def __init__(self, cache_dir: str | None = None):
         self.cache_dir = Path(cache_dir or self.DEFAULT_CACHE_DIR)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.sources: dict[str, KnowledgeSource] = {}
-        self._register_default_sources()
+        self._discover_sources()
 
-    def _register_default_sources(self):
-        """Register all available knowledge sources."""
-        sources = [
-            KnowledgeSource(
-                name="gene_text_emb",
-                description="Gene function text embeddings from GPT-4 descriptions (768d)",
-                dims=768,
-                path=str(self.cache_dir / "gene_text_embeddings.npz"),
-            ),
-            KnowledgeSource(
-                name="gene_ontology",
-                description="Gene Ontology graph embeddings (128d)",
-                dims=128,
-                path=str(self.cache_dir / "gene_ontology_embeddings.npz"),
-            ),
-            KnowledgeSource(
-                name="ppi_network",
-                description="Protein-protein interaction network from STRING (sparse adjacency)",
-                dims=0,  # sparse matrix, not fixed dims
-                path=str(self.cache_dir / "ppi_string.npz"),
-            ),
-            KnowledgeSource(
-                name="pathway_membership",
-                description="Reactome pathway membership matrix (N genes x P pathways)",
-                dims=0,
-                path=str(self.cache_dir / "reactome_pathways.npz"),
-            ),
-            KnowledgeSource(
-                name="esm_structure",
-                description="ESM protein structure embeddings (1280d)",
-                dims=1280,
-                path=str(self.cache_dir / "esm_structure_embeddings.npz"),
-            ),
-            KnowledgeSource(
-                name="drug_target",
-                description="Drug-target affinity matrix from ChEMBL (D drugs x N genes)",
-                dims=0,
-                path=str(self.cache_dir / "chembl_drug_target.npz"),
-            ),
-        ]
-        for s in sources:
-            self.sources[s.name] = s
+    def _discover_sources(self):
+        """Register only sources that genuinely exist on disk with a usable index.
+
+        No hardcoded/fabricated sources: what you see is what is really available.
+        """
+        if not self.cache_dir.exists():
+            return
+        for path in sorted(self.cache_dir.glob("*.npz")):
+            try:
+                data = np.load(path, allow_pickle=True)
+                if "index" not in data:
+                    continue  # a knowledge source without an entity index is unusable
+                description = str(data["description"]) if "description" in data else path.stem
+                self.sources[path.stem] = KnowledgeSource(
+                    name=path.stem, description=description, path=str(path)
+                )
+            except Exception:
+                continue  # unreadable file -> simply not available (never fabricated)
+
+    def register_source(self, name: str, data: np.ndarray, index: dict,
+                        description: str) -> KnowledgeSource:
+        """Seam for real sources built in-process (e.g. during a real-data campaign)."""
+        src = KnowledgeSource(name=name, description=description, data=np.asarray(data),
+                              index=dict(index), loaded=True)
+        self.sources[name] = src
+        return src
 
     def available_sources(self) -> list[str]:
-        """List available knowledge sources (those with pre-computed data)."""
-        return [name for name, s in self.sources.items() if Path(s.path).exists()]
-
-    def all_sources(self) -> list[str]:
-        """List all registered knowledge sources."""
         return list(self.sources.keys())
 
     def load(self, source_name: str) -> KnowledgeSource:
-        """Load a knowledge source into memory."""
         if source_name not in self.sources:
-            raise KeyError(f"Unknown knowledge source: {source_name}. Available: {list(self.sources.keys())}")
-
+            raise KeyError(f"Unknown knowledge source: {source_name}. "
+                           f"Available: {self.available_sources()}")
         source = self.sources[source_name]
         if source.loaded:
             return source
-
-        if not Path(source.path).exists():
-            raise FileNotFoundError(
-                f"Knowledge source '{source_name}' not pre-computed. "
-                f"Run `python -m knowledge.precompute --source {source_name}` first."
-            )
-
         data = np.load(source.path, allow_pickle=True)
-        source.data = data.get("embeddings", data.get("matrix", data.get("data")))
-        if "index" in data:
-            source.index = dict(data["index"].item()) if data["index"].ndim == 0 else None
+        source.data = data.get("data", data.get("embeddings", data.get("matrix")))
+        idx = data["index"]
+        source.index = idx.item() if getattr(idx, "ndim", 1) == 0 else dict(idx)
         source.loaded = True
         return source
 
     def get_embeddings(self, source_name: str, entities: list[str] | None = None) -> np.ndarray:
-        """Get embeddings for a knowledge source, optionally filtered to specific entities."""
         source = self.load(source_name)
         if source.data is None:
             raise RuntimeError(f"No data loaded for source '{source_name}'")
-
         if entities is None or source.index is None:
             return source.data
+        rows = [source.index[e] for e in entities if e in source.index]
+        return source.data[rows]
 
-        indices = []
-        for entity in entities:
-            if entity in source.index:
-                indices.append(source.index[entity])
-        return source.data[indices]
+    def coverage(self, source_name: str, entities: list[str]) -> tuple[int, int]:
+        """Return (n_covered, n_total) real coverage of `entities` by a source's index."""
+        source = self.load(source_name)
+        if not source.index:
+            return (0, len(entities))
+        covered = sum(1 for e in entities if e in source.index)
+        return (covered, len(entities))
 
     def get_knowledge_packet(self, gene_list: list[str] | None = None) -> str:
-        """
-        Build a knowledge packet string for the agent.
+        """Agent-facing description of genuinely-available, gene-covering knowledge."""
+        if not self.sources:
+            return (
+                "No external biological knowledge sources are configured for this task. "
+                "Rely on the biological structure already present in the dataset itself "
+                "(e.g. gene_pathway groupings and per-perturbation target features)."
+            )
 
-        This is included in the agent's prompt to inform architecture decisions.
-        """
-        available = self.available_sources()
-        if not available:
-            return "No pre-computed biological knowledge available. Run precompute.py first."
-
-        lines = [
-            "Available biological knowledge sources for this domain:",
-            "",
-        ]
-        for name in available:
-            source = self.sources[name]
-            lines.append(f"- **{name}**: {source.description}")
-            if source.dims > 0:
-                lines.append(f"  Dimensions: {source.dims}")
-
-            # Show coverage for gene list
-            if gene_list and Path(source.path).exists():
+        lines = ["External biological knowledge sources available for this task:", ""]
+        advertised = 0
+        for name, src in self.sources.items():
+            cov: Optional[tuple[int, int]] = None
+            if gene_list:
                 try:
-                    s = self.load(name)
-                    if s.index:
-                        covered = sum(1 for g in gene_list if g in s.index)
-                        lines.append(f"  Coverage: {covered}/{len(gene_list)} genes")
+                    cov = self.coverage(name, gene_list)
                 except Exception:
-                    pass
+                    cov = None
+                if not cov or cov[0] == 0:
+                    continue  # don't advertise a source that covers none of these genes
+            advertised += 1
+            line = f"- **{name}**: {src.description}"
+            if cov:
+                line += f"  (covers {cov[0]}/{cov[1]} of this task's genes)"
+            lines.append(line)
 
-        lines.extend([
+        if advertised == 0:
+            n = len(gene_list) if gene_list else 0
+            return (
+                f"Configured knowledge sources do not cover this task's gene identifiers "
+                f"(checked {n}). Rely on the dataset's own structure (gene_pathway, target "
+                "features) rather than external priors."
+            )
+
+        lines += [
             "",
-            "To use a knowledge source in train.py, load it via:",
+            "Load in train.py via:",
             "  from knowledge.retrieval import BioKnowledge",
-            "  kb = BioKnowledge()",
-            "  embeddings = kb.get_embeddings('source_name')",
-            "",
-            "You can incorporate these as:",
-            "- Initial gene embeddings",
-            "- Conditioning signals",
-            "- Graph adjacency for GNN message passing",
-            "- Regularization targets",
-            "- Feature augmentation",
-        ])
-
+            "  emb = BioKnowledge().get_embeddings('<source_name>', entities=gene_names)",
+        ]
         return "\n".join(lines)
