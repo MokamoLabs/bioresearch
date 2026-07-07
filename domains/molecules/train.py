@@ -184,7 +184,8 @@ class MoleculeGenerator:
 def main():
     t_start = time.time()
 
-    dataset = load_data(use_tdc=False)  # Change to True when TDC is available
+    # BIORESEARCH_DATASET=real selects the real TDC ADMET benchmark; default is synthetic.
+    dataset = load_data(use_tdc=(os.environ.get("BIORESEARCH_DATASET") == "real"))
     print(f"Dataset: {len(dataset.smiles)} molecules, {len(dataset.endpoint_names)} endpoints")
 
     # --- Layer 1: ADMET Prediction ---

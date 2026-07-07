@@ -300,6 +300,16 @@ def cmd_search(args):
     metric_specs = _get_metric_specs(args.domain)
     knowledge_fn = _make_knowledge_fn(args.domain)
 
+    # Dataset selection. Real benchmarks have no oracle, so headroom reporting is disabled
+    # for them; the env var is inherited by the training subprocesses (local runner).
+    dataset_mode = getattr(args, "dataset", "synthetic")
+    if dataset_mode == "real":
+        os.environ["BIORESEARCH_DATASET"] = "real"
+        print(f"Dataset: REAL benchmark for '{args.domain}' (no oracle ceiling)")
+    else:
+        os.environ.pop("BIORESEARCH_DATASET", None)
+    ceiling_fn = None if dataset_mode == "real" else _make_ceiling_fn(args.domain, list(range(args.seeds)))
+
     # Set up compute runner based on mode
     run_seeds_parallel = None
     compute_mode = args.compute
@@ -361,7 +371,7 @@ def cmd_search(args):
             loop_config=config,
             knowledge_fn=knowledge_fn,
             run_seeds_parallel=run_seeds_parallel,
-            ceiling_fn=_make_ceiling_fn(args.domain, list(range(args.seeds))),
+            ceiling_fn=ceiling_fn,
         )
 
 
@@ -460,6 +470,9 @@ def main():
     search_parser = subparsers.add_parser("search", help="Run autoresearch loop")
     search_parser.add_argument("--domain", required=True, choices=["perturbation", "molecules", "trials", "negative_control"])
     search_parser.add_argument("--iterations", type=int, default=100)
+    search_parser.add_argument("--dataset", type=str, default="synthetic",
+                               choices=["synthetic", "real"],
+                               help="synthetic multi-world task (default) or the real benchmark")
     search_parser.add_argument("--seeds", type=int, default=5)
     search_parser.add_argument("--time-budget", type=int, default=600)
     search_parser.add_argument("--population", type=int, default=0, help="Number of agents for population search (0=single)")

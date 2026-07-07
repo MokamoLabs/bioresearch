@@ -79,8 +79,10 @@ class LinearPerturbModel:
 def main():
     t_start = time.time()
 
-    # Load data
-    dataset = load_data("synthetic")  # Start with synthetic; change to "norman_2019" for real data
+    # Load data. BIORESEARCH_DATASET=real selects the real Norman 2019 benchmark; the
+    # default is the multi-world synthetic task. Keep this selector intact.
+    _dataset = "norman_2019" if os.environ.get("BIORESEARCH_DATASET") == "real" else "synthetic"
+    dataset = load_data(_dataset)
     print(f"Dataset: {dataset.n_samples} samples, {dataset.n_genes} genes")
     print(f"Train: {len(dataset.train_idx)}, Val: {len(dataset.val_idx)}, Test: {len(dataset.test_idx)}")
 

@@ -173,7 +173,9 @@ class TrialPredictionModel:
 def main():
     t_start = time.time()
 
-    dataset = load_data(use_tdc=False)
+    # BIORESEARCH_DATASET=real selects real TDC trial data (falls back to synthetic if
+    # unavailable); default is the multi-world synthetic task.
+    dataset = load_data(use_tdc=(os.environ.get("BIORESEARCH_DATASET") == "real"))
     print(f"Dataset: {len(dataset.labels)} trials, {dataset.features.shape[1]} base features")
     print(f"Success rate: {dataset.labels.mean():.1%}")
 
