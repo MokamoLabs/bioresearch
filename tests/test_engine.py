@@ -225,13 +225,16 @@ class TestClientFactory:
             config = OrchestratorConfig()
             env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
             with patch.dict(os.environ, env, clear=True):
+                # Client is created lazily; construction must succeed, and the
+                # missing-key error surfaces only on first client access.
+                orch = Orchestrator(
+                    config=config,
+                    domain_dir=domain_dir,
+                    output_dir=tmpdir,
+                    metric_specs=[],
+                )
                 with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY not set"):
-                    Orchestrator(
-                        config=config,
-                        domain_dir=domain_dir,
-                        output_dir=tmpdir,
-                        metric_specs=[],
-                    )
+                    _ = orch.client
 
     def test_vertex_client_without_project_id(self):
         from engine.orchestrator import Orchestrator
@@ -247,13 +250,14 @@ class TestClientFactory:
                 # Mock AnthropicVertex so we don't need the dependency
                 mock_vertex = MagicMock()
                 with patch.dict("sys.modules", {"anthropic": MagicMock(AnthropicVertex=mock_vertex)}):
+                    orch = Orchestrator(
+                        config=config,
+                        domain_dir=domain_dir,
+                        output_dir=tmpdir,
+                        metric_specs=[],
+                    )
                     with pytest.raises(RuntimeError, match="Vertex AI requires a GCP project ID"):
-                        Orchestrator(
-                            config=config,
-                            domain_dir=domain_dir,
-                            output_dir=tmpdir,
-                            metric_specs=[],
-                        )
+                        _ = orch.client
 
     def test_vertex_client_with_config(self):
         from engine.orchestrator import Orchestrator
@@ -278,6 +282,7 @@ class TestClientFactory:
                     output_dir=tmpdir,
                     metric_specs=[],
                 )
+                _ = orch.client  # trigger lazy creation
                 mock_vertex_cls.assert_called_once_with(
                     project_id="test-project", region="us-east5"
                 )
@@ -362,3 +367,76 @@ class TestRecommendComputeMode:
             modal_ok=True,
         )
         assert result == "modal"
+
+
+class TestValidityFixes:
+    """Regression tests for the Phase-1 correctness fixes."""
+
+    def _make_domain(self, tmpdir, code="print('hello')"):
+        domain_dir = os.path.join(tmpdir, "domain")
+        os.makedirs(domain_dir, exist_ok=True)
+        with open(os.path.join(domain_dir, "train.py"), "w") as f:
+            f.write(code)
+        with open(os.path.join(domain_dir, "program.md"), "w") as f:
+            f.write("prog")
+        with open(os.path.join(domain_dir, "prepare.py"), "w") as f:
+            f.write("# prepare")
+        return domain_dir
+
+    def test_get_context_surfaces_real_baseline_not_zero(self):
+        """get_context must feed the agent true baseline means, not a hardcoded 0.0."""
+        from engine.orchestrator import Orchestrator
+
+        specs = [MetricSpec("pearson_deg", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domain_dir = self._make_domain(tmpdir)
+            orch = Orchestrator(OrchestratorConfig(), domain_dir,
+                                os.path.join(tmpdir, "out"), specs)
+            # Nothing evaluated yet -> no fabricated decision.
+            assert orch.get_context().last_decision is None
+
+            base = ExperimentResult("base", "b",
+                [SeedResult(i, {"pearson_deg": 0.70 + i * 0.01}) for i in range(5)])
+            cand = ExperimentResult("cand", "c",
+                [SeedResult(i, {"pearson_deg": 0.80 + i * 0.01}) for i in range(5)])
+            decision = evaluate_experiment(base, cand, specs)
+            orch.handle_decision(decision, cand)
+
+            comp = orch.get_context().last_decision.all_comparisons[0]
+            assert abs(comp.baseline_mean - 0.72) < 1e-6   # real value, not 0.0
+            assert abs(comp.candidate_mean - 0.82) < 1e-6
+
+    def test_population_writes_code_only_on_keep(self):
+        """Population must not persist rejected code (previously it wrote unconditionally)."""
+        from engine.population import PopulationSearch, PopulationConfig
+
+        specs = [MetricSpec("pearson_deg", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            baseline_code = "print('baseline')"
+            domain_dir = self._make_domain(tmpdir, code=baseline_code)
+
+            holder = {"value": 0.20}
+
+            def stub(domain_dir_, train_code, seeds, time_budget):
+                return [SeedResult(s, {"pearson_deg": holder["value"] + s * 1e-4})
+                        for s in seeds]
+
+            config = PopulationConfig(num_agents=1, domain_dir=domain_dir,
+                                      output_dir=os.path.join(tmpdir, "out"), num_seeds=5)
+            search = PopulationSearch(specs, config, run_seeds_parallel=stub)
+            agent = search.agents[0]
+            agent.current_baseline = ExperimentResult("base", "b",
+                [SeedResult(i, {"pearson_deg": 0.20 + i * 1e-4}) for i in range(5)])
+
+            new_code = "print('candidate')"
+            agent.orchestrator.propose_modification = lambda ctx: ("hyp", new_code)
+
+            # REVERT: no improvement -> working code stays at the baseline.
+            holder["value"] = 0.20
+            search._run_agent_iteration(agent)
+            assert agent.orchestrator.current_code == baseline_code
+
+            # KEEP: clear improvement -> working code becomes the candidate.
+            holder["value"] = 0.60
+            search._run_agent_iteration(agent)
+            assert agent.orchestrator.current_code == new_code

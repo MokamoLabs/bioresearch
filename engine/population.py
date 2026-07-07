@@ -186,15 +186,17 @@ class PopulationSearch:
             action = "KEEP" if decision.keep else "REVERT"
             print(f"  Decision: {action}")
 
-            agent.orchestrator.apply_modification(new_code)
-            agent.orchestrator.handle_decision(decision, candidate)
-
+            # Only commit the candidate code on KEEP. On REVERT the working train.py
+            # stays at the last-kept baseline, so the next proposal builds on good code
+            # (mirrors the single-agent loop; previously population wrote rejected code).
             if decision.keep:
+                agent.orchestrator.apply_modification(new_code)
                 agent.current_baseline = candidate
                 score = candidate.metric_mean(self.primary_metric.name)
                 if self.primary_metric.is_improvement(score, agent.best_primary_score):
                     agent.best_primary_score = score
 
+            agent.orchestrator.handle_decision(decision, candidate)
             agent.iteration_count += 1
 
         except Exception as e:

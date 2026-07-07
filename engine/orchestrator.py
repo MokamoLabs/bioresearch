@@ -24,7 +24,6 @@ from engine.metrics import (
     ExperimentResult,
     EvaluationDecision,
     MetricSpec,
-    ComparisonResult,
 )
 from engine.tracker import ExperimentTracker, ExperimentRecord
 
@@ -97,8 +96,21 @@ class Orchestrator:
         self.baseline_code = self.current_code
         self.best_code = self.current_code
 
-        self.client = self._create_client(config)
+        # The most recent real evaluation decision (with correct baseline means and
+        # loop-consistent significance flags). Surfaced verbatim to the next prompt so
+        # the agent never sees fabricated comparison numbers.
+        self.last_decision: Optional[EvaluationDecision] = None
+
+        # Client is created lazily on first use so the orchestrator can be constructed
+        # (and unit-tested) without API credentials.
+        self._client = None
         self.tracker = ExperimentTracker(str(self.output_dir))
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = self._create_client(self.config)
+        return self._client
 
     def _create_client(self, config: OrchestratorConfig):
         """Create the appropriate Anthropic client based on backend config."""
@@ -379,6 +391,10 @@ Study this to understand the data structure, split strategy, and how metrics are
             self.state = AgentState.REVERTING
             # Code was never written on revert (apply_modification not called)
 
+        # Store the real decision so the next prompt shows true baseline->candidate
+        # numbers and loop-consistent significance flags (not a reconstruction).
+        self.last_decision = decision
+
         # Log to tracker
         record = ExperimentRecord(
             experiment_id=experiment.experiment_id,
@@ -417,38 +433,12 @@ Study this to understand the data structure, split strategy, and how metrics are
             except Exception as e:
                 knowledge = f"(Knowledge retrieval failed: {e})"
 
-        last_decision = None
-        if self.tracker.records:
-            last_rec = self.tracker.records[-1]
-            comparisons = []
-            for name in last_rec.metrics:
-                comparisons.append(ComparisonResult(
-                    metric_name=name,
-                    baseline_mean=0.0,
-                    candidate_mean=last_rec.metrics[name],
-                    t_statistic=0.0,
-                    p_value=last_rec.p_values.get(name, 1.0),
-                    effect_size=last_rec.effect_sizes.get(name, 0.0),
-                    ci_low=0.0,
-                    ci_high=0.0,
-                    is_improvement=last_rec.status == "keep",
-                    is_significant=last_rec.p_values.get(name, 1.0) < 0.05,
-                    is_meaningful=last_rec.effect_sizes.get(name, 0.0) > 0.3,
-                ))
-            last_decision = EvaluationDecision(
-                keep=last_rec.status == "keep",
-                reason=last_rec.decision_reason,
-                primary_comparisons=[],
-                guard_violations=[],
-                all_comparisons=comparisons,
-            )
-
         return AgentContext(
             iteration=self.iteration,
             current_code=self.current_code,
             baseline_code=self.baseline_code,
             metric_specs=self.metric_specs,
             experiment_history=self.tracker.records,
-            last_decision=last_decision,
+            last_decision=self.last_decision,
             knowledge_packet=knowledge,
         )

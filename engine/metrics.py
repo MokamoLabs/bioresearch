@@ -1,10 +1,20 @@
 """
 Statistical testing framework for experiment evaluation.
 
-Every experiment runs across multiple seeds. We keep a result only if:
-- Primary metric improves with p < 0.05 (Welch's t-test)
-- All guard metrics stay within thresholds
-- Effect size (Cohen's d) > 0.3
+Every experiment runs across multiple seeds. By default we keep a candidate only if:
+- At least one PRIMARY metric improves in the correct direction, with a
+  paired one-sided t-test p < alpha (default alpha=0.10) AND
+  paired Cohen's d > min_effect_size (default 0.15)
+- No GUARD metric degrades past its threshold (with a near-zero-baseline floor)
+
+Paired testing is used when baseline and candidate share seed indices (the common
+case); it compares each candidate seed against its matched baseline seed, which is
+far more powerful than the unpaired Welch test when cross-seed variance is large.
+
+NOTE: paired Cohen's d is mean(diff)/std(diff). When a model is near-deterministic
+across seeds, std(diff) is tiny and d explodes, so the effect-size guard is weak on
+its own. The loop compensates with confirmation re-runs on fresh seeds (see
+engine/loop.py) rather than relying on a single selection pass.
 """
 
 from __future__ import annotations
@@ -337,10 +347,10 @@ def evaluate_experiment(
         if all_identical:
             reason = (
                 "IDENTICAL OUTPUT: candidate produced numerically identical metrics to baseline. "
-                "Your code modification did not change the model's predictions. "
-                "Check for: (1) bugs causing fallback to baseline logic, (2) models that collapse "
-                "to mean delta, (3) unused features. The biggest improvement comes from using "
-                "dataset.pert_features to predict unseen perturbations. | " + reason
+                "Your code modification did not change the model's predictions. Check for: "
+                "(1) a bug causing a fallback to the baseline code path, (2) a model that "
+                "collapses to a trivial constant predictor, or (3) features that are computed "
+                "but never used. | " + reason
             )
 
         return EvaluationDecision(
