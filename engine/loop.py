@@ -26,8 +26,10 @@ from typing import Callable, Optional
 
 from engine.metrics import (
     ExperimentResult,
+    EvaluationDecision,
     SeedResult,
     MetricSpec,
+    MetricRole,
     evaluate_experiment,
 )
 from engine.orchestrator import Orchestrator, OrchestratorConfig
@@ -45,6 +47,10 @@ class LoopConfig:
     min_effect_size: float = 0.15
     time_budget_per_seed: int = 600  # seconds
     paired: bool = True
+    # Validity harness:
+    confirm: bool = True             # re-test a keep on fresh worlds before committing
+    confirmation_seed_offset: int = 1000  # fresh worlds = seeds + this offset
+    locked_test: bool = True         # final one-shot eval on the untouched test split
     orchestrator_config: Optional[OrchestratorConfig] = None
 
 
@@ -203,6 +209,7 @@ def autoresearch_loop(
     run_fn: Optional[RunExperimentFn] = None,
     knowledge_fn: Optional[Callable[[], str]] = None,
     run_seeds_parallel: Optional[Callable[[str, str, list[int], int], list[SeedResult]]] = None,
+    ceiling_fn: Optional[Callable[[str], dict]] = None,
 ):
     """
     Main autoresearch loop.
@@ -213,6 +220,8 @@ def autoresearch_loop(
         run_fn: Function to run a single experiment (seed). Used if run_seeds_parallel is None.
         knowledge_fn: Optional function returning biological knowledge context
         run_seeds_parallel: Optional function to run all seeds in parallel (e.g., via Modal)
+        ceiling_fn: Optional fn(split) -> {metric: CeilingReport} for synthetic tasks, used
+            to report "% of achievable headroom captured". None for real data.
     """
     if run_fn is None:
         run_fn = run_local_experiment
@@ -277,6 +286,18 @@ def autoresearch_loop(
     ))
     orchestrator.iteration = 1
 
+    # Achievable-headroom reference (synthetic tasks only; None for real data).
+    ceiling_report = None
+    if ceiling_fn is not None:
+        try:
+            ceiling_report = ceiling_fn("select")
+            if ceiling_report:
+                print("\nAchievable headroom (select split, floor -> oracle):")
+                for m, c in ceiling_report.items():
+                    print(f"  {m}: {c.floor:.4f} -> {c.oracle:.4f}")
+        except Exception as e:
+            print(f"(ceiling unavailable: {e})")
+
     # Main loop
     for iteration in range(loop_config.max_iterations):
         print(f"\n{'=' * 60}")
@@ -306,7 +327,10 @@ def autoresearch_loop(
                 mean = candidate.metric_mean(spec.name)
                 std = candidate.metric_std(spec.name)
                 b_mean = current_baseline.metric_mean(spec.name)
-                print(f"  {spec.name}: {mean:.6f} +/- {std:.6f} (baseline: {b_mean:.6f})")
+                cap = ""
+                if ceiling_report and spec.name in ceiling_report and not _isnan(mean):
+                    cap = f"  [{ceiling_report[spec.name].fraction_captured(mean) * 100:.0f}% of headroom]"
+                print(f"  {spec.name}: {mean:.6f} +/- {std:.6f} (baseline: {b_mean:.6f}){cap}")
 
             # 3. Evaluate
             decision = evaluate_experiment(
@@ -319,7 +343,23 @@ def autoresearch_loop(
                 paired=loop_config.paired,
             )
 
-            # 4. Keep or revert
+            # 4. Confirmation on FRESH worlds before committing (winner's-curse guard).
+            if decision.keep and loop_config.confirm:
+                print("  Passed initial test — confirming on fresh worlds...")
+                confirm = _run_confirmation(
+                    orchestrator, new_code, list(range(loop_config.num_seeds)),
+                    metric_specs, loop_config, run_fn, run_seeds_parallel,
+                )
+                if not confirm.keep:
+                    decision = EvaluationDecision(
+                        keep=False,
+                        reason=f"Reverted: passed initial test but FAILED confirmation on fresh worlds ({confirm.reason})",
+                        primary_comparisons=decision.primary_comparisons,
+                        guard_violations=confirm.guard_violations,
+                        all_comparisons=decision.all_comparisons,
+                    )
+
+            # 5. Keep or revert
             action = "KEEP" if decision.keep else "REVERT"
             print(f"Decision: {action} -- {decision.reason}")
 
@@ -360,6 +400,16 @@ def autoresearch_loop(
     summary = orchestrator.tracker.generate_summary()
     print(summary)
 
+    # Keep-rate. On the negative_control domain this IS the empirical false-positive rate.
+    _report_keep_rate(orchestrator.tracker)
+
+    # Locked-test evaluation of the best committed model — an unbiased final estimate on the
+    # test split, which was never used for any keep/revert decision.
+    if loop_config.locked_test:
+        _report_locked_test(
+            orchestrator, metric_specs, loop_config, run_fn, run_seeds_parallel, ceiling_fn,
+        )
+
     # Final plots
     metric_names = [s.name for s in metric_specs]
     directions = {s.name: s.direction.value for s in metric_specs}
@@ -398,3 +448,102 @@ def _run_multi_seed(
         seed_results=seed_results,
         code_diff="",
     )
+
+
+def _isnan(x: float) -> bool:
+    return x != x
+
+
+def _run_confirmation(orchestrator, new_code, seeds, metric_specs, loop_config,
+                      run_fn, run_seeds_parallel) -> "EvaluationDecision":
+    """Re-run baseline and candidate on FRESH worlds; return the confirmation decision.
+
+    Fresh worlds = the standard seeds shifted by confirmation_seed_offset, so the data
+    realizations are disjoint from those used for the initial keep. A candidate that only
+    got lucky on the original worlds fails here — this is the winner's-curse guard.
+    """
+    confirm_seeds = [s + loop_config.confirmation_seed_offset for s in seeds]
+    base_confirm = _run_multi_seed(
+        domain_dir=loop_config.domain_dir, train_code=orchestrator.baseline_code,
+        seeds=confirm_seeds, time_budget=loop_config.time_budget_per_seed,
+        run_fn=run_fn, run_seeds_parallel=run_seeds_parallel,
+        experiment_id="confirm_base", description="confirmation baseline",
+    )
+    cand_confirm = _run_multi_seed(
+        domain_dir=loop_config.domain_dir, train_code=new_code,
+        seeds=confirm_seeds, time_budget=loop_config.time_budget_per_seed,
+        run_fn=run_fn, run_seeds_parallel=run_seeds_parallel,
+        experiment_id="confirm_cand", description="confirmation candidate",
+    )
+    return evaluate_experiment(
+        baseline=base_confirm, candidate=cand_confirm, metric_specs=metric_specs,
+        alpha=loop_config.alpha, min_effect_size=loop_config.min_effect_size,
+        min_seeds=loop_config.min_seeds_for_decision, paired=loop_config.paired,
+    )
+
+
+def _run_locked_test(train_code, seeds, loop_config, run_fn, run_seeds_parallel) -> ExperimentResult:
+    """Evaluate a committed model once on the TEST split by setting EVAL_SPLIT=test.
+
+    Each domain's train.py honours EVAL_SPLIT (local runner inherits os.environ). NOTE: the
+    Modal runner does not yet propagate EVAL_SPLIT — wire it in Phase 3 for remote locked
+    tests.
+    """
+    prev = os.environ.get("EVAL_SPLIT")
+    os.environ["EVAL_SPLIT"] = "test"
+    try:
+        return _run_multi_seed(
+            domain_dir=loop_config.domain_dir, train_code=train_code, seeds=seeds,
+            time_budget=loop_config.time_budget_per_seed, run_fn=run_fn,
+            run_seeds_parallel=run_seeds_parallel, experiment_id="locked_test",
+            description="locked-test evaluation",
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("EVAL_SPLIT", None)
+        else:
+            os.environ["EVAL_SPLIT"] = prev
+
+
+def _report_keep_rate(tracker):
+    decided = [r for r in tracker.records
+               if r.status in ("keep", "revert") and r.experiment_id != "baseline"]
+    if not decided:
+        return
+    kept = sum(1 for r in decided if r.status == "keep")
+    print(f"\nKeep rate: {kept}/{len(decided)} = {100.0 * kept / len(decided):.0f}%")
+    print("  (On the negative_control domain, this is the empirical FALSE-POSITIVE rate.)")
+
+
+def _report_locked_test(orchestrator, metric_specs, loop_config, run_fn,
+                        run_seeds_parallel, ceiling_fn):
+    print("\n" + "=" * 60)
+    print("Locked-test evaluation (test split — never used for selection)")
+    print("=" * 60)
+    try:
+        test_result = _run_locked_test(
+            orchestrator.best_code, list(range(loop_config.num_seeds)),
+            loop_config, run_fn, run_seeds_parallel,
+        )
+    except Exception as e:
+        print(f"  Locked-test evaluation failed: {e}")
+        return
+    if test_result.num_successful == 0:
+        print("  Locked-test evaluation produced no successful seeds.")
+        return
+
+    test_ceiling = None
+    if ceiling_fn is not None:
+        try:
+            test_ceiling = ceiling_fn("test")
+        except Exception:
+            test_ceiling = None
+
+    for spec in metric_specs:
+        if spec.role != MetricRole.PRIMARY:
+            continue
+        m = test_result.metric_mean(spec.name)
+        if test_ceiling and spec.name in test_ceiling and not _isnan(m):
+            print(f"  {test_ceiling[spec.name].summarize(m)}")
+        else:
+            print(f"  {spec.name} (test): {m:.6f}")

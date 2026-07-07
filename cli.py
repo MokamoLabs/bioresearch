@@ -36,8 +36,11 @@ def _get_metric_specs(domain: str):
     elif domain == "molecules":
         return [
             MetricSpec("composite_admet", MetricRole.PRIMARY, MetricDirection.HIGHER),
-            MetricSpec("gen_profile_match", MetricRole.PRIMARY, MetricDirection.HIGHER),
-            MetricSpec("gen_diversity", MetricRole.GUARD, MetricDirection.HIGHER, guard_threshold=0.3),
+            # Generation metrics need real chemistry (rdkit + valid SMILES). In synthetic
+            # mode they are constants, so they are DIAGNOSTIC (reported, not gated) until
+            # the real TDC adapter is wired in Phase 3 — then they become gated objectives.
+            MetricSpec("gen_profile_match", MetricRole.DIAGNOSTIC, MetricDirection.HIGHER),
+            MetricSpec("gen_diversity", MetricRole.DIAGNOSTIC, MetricDirection.HIGHER),
         ]
     elif domain == "trials":
         return [
@@ -45,6 +48,11 @@ def _get_metric_specs(domain: str):
             MetricSpec("calibration_ece", MetricRole.GUARD, MetricDirection.LOWER, guard_threshold=0.15),
             MetricSpec("net_value", MetricRole.GUARD, MetricDirection.HIGHER, guard_threshold=0.0),
             MetricSpec("lift_at_10", MetricRole.BONUS, MetricDirection.HIGHER),
+        ]
+    elif domain == "negative_control":
+        # Signal-free calibration task: the loop's keep-rate here IS its false-positive rate.
+        return [
+            MetricSpec("accuracy", MetricRole.PRIMARY, MetricDirection.HIGHER),
         ]
     else:
         raise ValueError(f"Unknown domain: {domain}")
@@ -58,9 +66,10 @@ def _make_knowledge_fn(domain: str):
     available = kb.available_sources()
 
     if not available:
-        print(f"No pre-computed knowledge sources found. Run:")
-        print(f"  python -m knowledge.precompute --all")
-        print(f"Proceeding without biological knowledge augmentation.\n")
+        print("No external biological knowledge sources configured "
+              "(none are fabricated). To add a real one, e.g.:")
+        print("  python -m knowledge.precompute --pathways path/to/reactome.gmt")
+        print("Proceeding without external knowledge augmentation.\n")
         return None
 
     print(f"Knowledge sources available: {available}")
@@ -79,6 +88,48 @@ def _make_knowledge_fn(domain: str):
         return kb.get_knowledge_packet(gene_list=gene_list)
 
     return knowledge_fn
+
+
+def _make_ceiling_fn(domain: str, seeds: list[int]):
+    """Return fn(split) -> {metric: CeilingReport} averaged over the given synthetic worlds.
+
+    Used by the loop to report "% of achievable headroom captured". Returns None for
+    domains without a synthetic oracle (i.e. real data).
+    """
+    import importlib
+
+    adapters = {
+        "perturbation": "domains.perturbation.prepare",
+        "molecules": "domains.molecules.prepare",
+        "trials": "domains.trials.prepare",
+        "negative_control": "domains.negative_control.prepare",
+    }
+    if domain not in adapters:
+        return None
+    try:
+        adapter = getattr(importlib.import_module(adapters[domain]), "SyntheticAdapter")()
+        from domains.base import CeilingReport
+    except Exception:
+        return None
+
+    def fn(split: str = "select"):
+        agg: dict = {}  # metric -> [floor_sum, oracle_sum, count, higher_is_better]
+        for s in seeds:
+            try:
+                rep = adapter.oracle_ceiling(world_seed=s, split=split)
+            except Exception:
+                continue
+            for m, c in rep.items():
+                slot = agg.setdefault(m, [0.0, 0.0, 0, c.higher_is_better])
+                slot[0] += c.floor
+                slot[1] += c.oracle
+                slot[2] += 1
+        return {
+            m: CeilingReport(m, f / n, o / n, higher_is_better=higher)
+            for m, (f, o, n, higher) in agg.items() if n > 0
+        }
+
+    return fn
 
 
 def _make_modal_runner(domain: str):
@@ -310,6 +361,7 @@ def cmd_search(args):
             loop_config=config,
             knowledge_fn=knowledge_fn,
             run_seeds_parallel=run_seeds_parallel,
+            ceiling_fn=_make_ceiling_fn(args.domain, list(range(args.seeds))),
         )
 
 
@@ -406,7 +458,7 @@ def main():
 
     # search command
     search_parser = subparsers.add_parser("search", help="Run autoresearch loop")
-    search_parser.add_argument("--domain", required=True, choices=["perturbation", "molecules", "trials"])
+    search_parser.add_argument("--domain", required=True, choices=["perturbation", "molecules", "trials", "negative_control"])
     search_parser.add_argument("--iterations", type=int, default=100)
     search_parser.add_argument("--seeds", type=int, default=5)
     search_parser.add_argument("--time-budget", type=int, default=600)
@@ -426,7 +478,7 @@ def main():
 
     # predict command
     predict_parser = subparsers.add_parser("predict", help="Run prediction")
-    predict_parser.add_argument("--domain", required=True, choices=["perturbation", "molecules", "trials"])
+    predict_parser.add_argument("--domain", required=True, choices=["perturbation", "molecules", "trials", "negative_control"])
     predict_parser.add_argument("--input", type=str, help="Input data (e.g., SMILES string)")
     predict_parser.add_argument("--dataset", type=str, help="Dataset name")
 
