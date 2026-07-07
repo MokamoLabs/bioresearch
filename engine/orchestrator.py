@@ -24,6 +24,7 @@ from engine.metrics import (
     ExperimentResult,
     EvaluationDecision,
     MetricSpec,
+    MetricRole,
 )
 from engine.tracker import ExperimentTracker, ExperimentRecord
 
@@ -101,6 +102,14 @@ class Orchestrator:
         # the agent never sees fabricated comparison numbers.
         self.last_decision: Optional[EvaluationDecision] = None
 
+        # Primary metric, used for the research ledger / falsification.
+        self.primary_metric = next(
+            (s for s in metric_specs if s.role == MetricRole.PRIMARY), None
+        )
+        # The agent's most recent falsifiable prediction (text + parsed expected value).
+        self.last_prediction: str = ""
+        self.last_predicted_value: Optional[float] = None
+
         # Client is created lazily on first use so the orchestrator can be constructed
         # (and unit-tested) without API credentials.
         self._client = None
@@ -171,33 +180,44 @@ class Orchestrator:
 {metric_desc}
 
 ## How Evaluation Works
-- Each experiment runs across multiple seeds. Each seed uses the SAME dataset but a different 90% random subsample of training data.
-- Your modification is compared to the baseline using a **paired one-sided t-test** (p < 0.10) and paired Cohen's d (> 0.15).
-- Genuine improvements that consistently help across seeds WILL be detected and kept.
-- Introduce stochastic elements (e.g., weight initialization, dropout, data augmentation) controlled by the SEED variable for robust evaluation.
+- Each experiment runs across multiple seeds. Each seed is an INDEPENDENT data realization
+  ("world"), so a change is only useful if it helps *consistently across worlds*, not on one
+  lucky draw. Avoid anything that fits a single realization.
+- Your modification is compared to the baseline with a **paired one-sided t-test** (p < 0.10)
+  and paired Cohen's d (> 0.15) on the selection split.
+- A candidate that passes is then **re-tested on a fresh set of worlds**; it is only kept if
+  it holds up there too. Final models are scored once on a locked test split.
+- For synthetic tasks the harness reports "% of achievable headroom captured" (floor = trivial
+  predictor, oracle = mechanism-aware upper bound). Aim to close that gap.
 
 ## Rules
 1. You ONLY modify train.py. The evaluation harness in prepare.py is FROZEN.
-2. Each experiment runs for a fixed time budget across multiple seeds.
-3. Your changes are kept only if they produce statistically significant improvement.
-4. You must output ONLY the complete, modified train.py content between <train_py> and </train_py> tags.
-5. Before the code, briefly explain your hypothesis in 1-2 sentences between <hypothesis> and </hypothesis> tags.
-6. Think carefully about what might work. Consider the biological domain knowledge provided.
-7. Make one focused change per iteration. Do not combine multiple unrelated ideas.
-8. The code must be complete and runnable. Do not use placeholders or TODOs.
-9. Preserve the output format: metrics must be printed as JSON on the last line of stdout.
-10. Keep the seed-controlled training subsample logic (rng = np.random.RandomState(SEED); subsample 90% of training data). This ensures meaningful statistical evaluation.
+2. Each experiment runs for a fixed time budget across multiple worlds/seeds.
+3. Your changes are kept only if they produce a statistically significant improvement that
+   survives confirmation on fresh worlds.
+4. Output ONLY the complete, modified train.py content between <train_py> and </train_py> tags.
+5. Before the code, state your reasoning in TWO tagged blocks:
+   - <hypothesis>...</hypothesis>: 1-2 sentences on the mechanism you think will help and why.
+   - <prediction>...</prediction>: a FALSIFIABLE prediction — the expected value of the
+     PRIMARY metric after this change (a number), and what would prove you wrong. The research
+     ledger will show your predicted vs observed value, so be honest and specific.
+6. Make one focused change per iteration. Do not combine multiple unrelated ideas.
+7. The code must be complete and runnable — no placeholders or TODOs.
+8. Preserve the output format: metrics printed as JSON on the last line of stdout.
+9. Keep any seed-controlled stochasticity intact so evaluation stays meaningful.
 
 ## Exploration Strategy
-- Track what you've tried. Avoid repeating the same family of approaches.
-- If regularization variants haven't worked after 3 attempts, switch to a completely different direction.
-- The data has gene pathway structure, expression-dependent effects, and cell-type-specific responses.
-  Models that capture these patterns will outperform the linear baseline.
-- Consider: MLP for nonlinear expression-delta mapping, cell-type conditioning,
-  pathway-aware features, attention over genes, ensemble methods.
+- Read the Research Ledger below: it records what you tried, what you predicted, and what
+  actually happened. Learn from failed predictions — a wrong prediction is information.
+- If a family of approaches fails a few times, switch to a fundamentally different direction.
+- Target the specific weakness the diagnostics reveal, rather than guessing.
+- The domain-specific structure and levers are described in the Program Constraints above;
+  discover the functional relationships from the data rather than assuming them.
 
 ## Evaluation Code (READ-ONLY reference — do NOT modify prepare.py)
-Study this to understand the data structure, split strategy, and how metrics are computed:
+Study this to understand the data structure, split strategy, and how metrics are computed.
+Note: for synthetic tasks the data GENERATOR is intentionally not shown — you must learn the
+patterns from the data itself.
 ```python
 {prepare_code}
 ```
@@ -217,28 +237,6 @@ Study this to understand the data structure, split strategy, and how metrics are
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for code/English."""
         return len(text) // 4
-
-    def _categorize_experiments(self, history: list) -> dict[str, list[str]]:
-        """Group experiments by approach category based on description keywords."""
-        categories: dict[str, list[str]] = {}
-        for rec in history:
-            desc = rec.description.lower()
-            if any(w in desc for w in ["shrink", "ridge", "regulariz", "l1", "l2", "weight decay", "dropout"]):
-                cat = "regularization"
-            elif any(w in desc for w in ["neural", "mlp", "hidden", "layer", "deep", "nonlinear"]):
-                cat = "neural_network"
-            elif any(w in desc for w in ["attention", "transformer", "self-attention"]):
-                cat = "attention"
-            elif any(w in desc for w in ["ensemble", "bagging", "boost", "averaging"]):
-                cat = "ensemble"
-            elif any(w in desc for w in ["graph", "gnn", "network", "pathway"]):
-                cat = "graph"
-            elif any(w in desc for w in ["feature", "engineer", "augment", "cell type", "cell-type"]):
-                cat = "feature_engineering"
-            else:
-                cat = "other"
-            categories.setdefault(cat, []).append(rec.status)
-        return categories
 
     def build_user_prompt(self, context: AgentContext) -> str:
         parts = []
@@ -273,63 +271,51 @@ Study this to understand the data structure, split strategy, and how metrics are
             parts.append(dec_section)
             token_budget -= self._estimate_tokens(dec_section)
 
-        # Experiment history (adaptive — include as many as fit, with reasons)
+        # Research ledger: hypothesis -> predicted -> observed for each past experiment, so
+        # the agent learns from its own (in)accurate predictions instead of a keyword count.
         if context.experiment_history and token_budget > 500:
-            history_lines = ["\n## Recent Experiment History"]
+            ledger = ["\n## Research Ledger (your experiments so far)",
+                      "Learn from these — an OFF prediction means your mental model was wrong there."]
             max_items = min(self.config.max_history_items, len(context.experiment_history))
-            recent = context.experiment_history[-max_items:]
-            for rec in recent:
-                metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in rec.metrics.items())
-                reason_str = f" | Reason: {rec.decision_reason[:80]}" if rec.decision_reason else ""
-                line = f"- [{rec.status}] {rec.description[:100]} | {metrics_str}{reason_str}"
-                line_tokens = self._estimate_tokens(line)
-                if token_budget - line_tokens < 200:
+            for rec in context.experiment_history[-max_items:]:
+                if rec.experiment_id == "baseline":
+                    continue
+                pred = f"{rec.predicted_primary:.3f}" if rec.predicted_primary is not None else "?"
+                obs = f"{rec.observed_primary:.3f}" if rec.observed_primary is not None else "?"
+                flag = ""
+                if rec.predicted_primary is not None and rec.observed_primary is not None:
+                    flag = " OK" if abs(rec.predicted_primary - rec.observed_primary) < 0.05 else " OFF"
+                line = (f"- iter {rec.iteration} [{rec.status}] predicted {pred} -> observed {obs}{flag}"
+                        f" | {rec.description[:80]}")
+                lt = self._estimate_tokens(line)
+                if token_budget - lt < 200:
                     break
-                history_lines.append(line)
-                token_budget -= line_tokens
-            if len(history_lines) > 1:
-                parts.append("\n".join(history_lines))
+                ledger.append(line)
+                token_budget -= lt
+            if len(ledger) > 2:
+                parts.append("\n".join(ledger))
 
-        # Approach categorization and diversity nudge
-        if context.experiment_history and token_budget > 500:
-            categories = self._categorize_experiments(context.experiment_history)
-            if categories:
-                cat_lines = ["\n## Tried Approach Categories"]
-                for cat, statuses in sorted(categories.items()):
-                    kept = statuses.count("keep")
-                    reverted = statuses.count("revert")
-                    cat_lines.append(f"- {cat}: {len(statuses)} attempts ({kept} kept, {reverted} reverted)")
-                all_categories = {"regularization", "neural_network", "attention", "ensemble", "graph", "feature_engineering"}
-                unexplored = all_categories - set(categories.keys())
-                if unexplored:
-                    cat_lines.append(f"-> Consider unexplored categories: {', '.join(sorted(unexplored))}")
-                cat_section = "\n".join(cat_lines)
-                parts.append(cat_section)
-                token_budget -= self._estimate_tokens(cat_section)
-
-            # Diversity instruction after consecutive reverts
+        # Diversity nudge after a run of reverts (domain-agnostic — the domain program.md
+        # carries any domain-specific levers).
+        if context.experiment_history and token_budget > 300:
             recent_reverts = 0
             for rec in reversed(context.experiment_history):
                 if rec.status == "revert":
                     recent_reverts += 1
-                else:
+                elif rec.status == "keep":
                     break
             if recent_reverts >= 5:
                 parts.append(
-                    f"\n## IMPORTANT: Diversity Required\n"
-                    f"The last {recent_reverts} experiments were all reverted. "
-                    "You MUST try a fundamentally different approach. Consider:\n"
-                    "- A completely different model architecture (MLP, attention, GNN)\n"
-                    "- Using biological knowledge priors\n"
-                    "- Novel feature engineering (gene interactions, pathway features)\n"
-                    "- Conditioning on cell type metadata\n"
-                    "- Ensemble methods\n"
-                    "Do NOT try another variation of regularization or shrinkage."
+                    f"\n## Change Direction\n"
+                    f"The last {recent_reverts} experiments were reverted. Stop tuning the current "
+                    "idea family — switch to a fundamentally different approach, and target the "
+                    "specific weakness your ledger and diagnostics reveal."
                 )
 
         parts.append(
             "\nNow propose your next modification to train.py. "
-            "Output your hypothesis and the complete modified train.py."
+            "Output your <hypothesis>, your falsifiable <prediction> (expected primary "
+            "metric value), and the complete modified <train_py>."
         )
 
         return "\n".join(parts)
@@ -355,7 +341,12 @@ Study this to understand the data structure, split strategy, and how metrics are
         text = response.content[0].text
 
         hypothesis = self._extract_tag(text, "hypothesis") or "No hypothesis provided"
+        prediction = self._extract_tag(text, "prediction") or ""
         new_code = self._extract_tag(text, "train_py") or ""
+
+        # Record the falsifiable prediction for the research ledger.
+        self.last_prediction = prediction
+        self.last_predicted_value = self._extract_number(prediction)
 
         if not new_code.strip():
             raise ValueError(
@@ -373,6 +364,19 @@ Study this to understand the data structure, split strategy, and how metrics are
         if start == -1 or end == -1:
             return None
         return text[start + len(start_tag):end].strip()
+
+    @staticmethod
+    def _extract_number(text: str) -> Optional[float]:
+        """Pull the first plausible numeric value from a prediction string, if any."""
+        import re
+
+        m = re.search(r"[-+]?\d*\.\d+|[-+]?\d+", text or "")
+        if not m:
+            return None
+        try:
+            return float(m.group())
+        except ValueError:
+            return None
 
     def apply_modification(self, code: str):
         """Write the new code to train.py (only called on KEEP)."""
@@ -395,6 +399,13 @@ Study this to understand the data structure, split strategy, and how metrics are
         # numbers and loop-consistent significance flags (not a reconstruction).
         self.last_decision = decision
 
+        # Falsification: compare the agent's predicted primary value to what was observed.
+        observed_primary = None
+        if self.primary_metric is not None:
+            observed_primary = experiment.metric_mean(self.primary_metric.name)
+            if observed_primary != observed_primary:  # NaN guard
+                observed_primary = None
+
         # Log to tracker
         record = ExperimentRecord(
             experiment_id=experiment.experiment_id,
@@ -415,6 +426,9 @@ Study this to understand the data structure, split strategy, and how metrics are
                 comp.metric_name: comp.effect_size
                 for comp in decision.all_comparisons
             },
+            prediction=self.last_prediction,
+            predicted_primary=self.last_predicted_value,
+            observed_primary=observed_primary,
             decision_reason=decision.reason,
             mean_train_seconds=sum(r.train_seconds for r in experiment.successful_seeds) / max(1, experiment.num_successful),
             mean_peak_vram_mb=sum(r.peak_vram_mb for r in experiment.successful_seeds) / max(1, experiment.num_successful),

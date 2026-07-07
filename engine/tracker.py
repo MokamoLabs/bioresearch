@@ -33,6 +33,10 @@ class ExperimentRecord:
     # Statistical test results
     p_values: dict[str, float] = field(default_factory=dict)
     effect_sizes: dict[str, float] = field(default_factory=dict)
+    # Research ledger: the agent's falsifiable prediction vs what was observed
+    prediction: str = ""
+    predicted_primary: Optional[float] = None
+    observed_primary: Optional[float] = None
     # Decision reason
     decision_reason: str = ""
     # Resource usage

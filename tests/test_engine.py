@@ -440,3 +440,52 @@ class TestValidityFixes:
             holder["value"] = 0.60
             search._run_agent_iteration(agent)
             assert agent.orchestrator.current_code == new_code
+
+
+class TestResearchLedger:
+    """Phase-6: falsifiable predictions recorded, and surfaced as a research ledger."""
+
+    def _domain(self, tmp):
+        d = os.path.join(tmp, "domain")
+        os.makedirs(d, exist_ok=True)
+        for f, c in (("train.py", "print(1)"), ("program.md", "p"), ("prepare.py", "# p")):
+            open(os.path.join(d, f), "w").write(c)
+        return d
+
+    def test_prediction_parsed_recorded_and_laddered(self):
+        from engine.orchestrator import Orchestrator
+
+        specs = [MetricSpec("pearson_deg", MetricRole.PRIMARY, MetricDirection.HIGHER)]
+        canned = ("<hypothesis>use target genes</hypothesis>"
+                  "<prediction>pearson_deg should rise to about 0.30</prediction>"
+                  "<train_py>print('model')</train_py>")
+
+        class _Resp:
+            content = [type("X", (), {"text": canned})()]
+
+        class _Client:
+            messages = type("M", (), {"create": lambda self, **k: _Resp()})()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = Orchestrator(OrchestratorConfig(), self._domain(tmp),
+                                os.path.join(tmp, "out"), specs)
+            orch._client = _Client()  # stub -> no API key needed
+
+            hyp, code = orch.propose_modification(orch.get_context())
+            assert code == "print('model')"
+            assert orch.last_predicted_value == 0.30   # parsed from the prediction text
+
+            base = ExperimentResult("base", "b",
+                [SeedResult(i, {"pearson_deg": 0.20}) for i in range(5)])
+            cand = ExperimentResult("iter_0001", "use target genes",
+                [SeedResult(i, {"pearson_deg": 0.28 + i * 1e-4}) for i in range(5)])
+            orch.handle_decision(evaluate_experiment(base, cand, specs), cand)
+
+            rec = orch.tracker.records[-1]
+            assert rec.predicted_primary == 0.30
+            assert abs(rec.observed_primary - 0.2802) < 0.01   # real observed value recorded
+
+            # The next prompt surfaces the ledger with predicted -> observed.
+            prompt = orch.build_user_prompt(orch.get_context())
+            assert "Research Ledger" in prompt
+            assert "predicted 0.300 -> observed 0.280" in prompt
