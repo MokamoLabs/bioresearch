@@ -3,107 +3,90 @@
 ## Task
 Improve the perturbation prediction model in `train.py`. The model predicts
 post-perturbation gene expression given control expression and a perturbation label.
+You are scored on how well the **predicted delta** (pred − ctrl) matches the **true
+delta** (truth − ctrl) on each perturbation's most-changed genes, per cell.
 
 ## What You Can Modify
-- `train.py` — everything is fair game: model architecture, optimizer, hyperparameters,
-  training loop, loss function, data augmentation, feature engineering.
+- `train.py` — everything: model architecture, optimizer, hyperparameters, training
+  loop, loss function, feature engineering.
 
 ## What You Cannot Modify
-- `prepare.py` — frozen evaluation harness. Do not touch.
-- The metric definitions or evaluation logic.
-- The data splits.
+- `prepare.py` — frozen evaluation harness (data loading + metrics). Do not touch.
+- The data splits or metric definitions.
 
 ## Constraints
 - Model must complete training within the TIME_BUDGET (default 600s).
 - Must output metrics as JSON on the last line of stdout.
-- Can use numpy, scipy, and torch (if GPU available).
-- Can import from `knowledge.retrieval` to access biological priors.
-- Each seed uses the same dataset but a different 90% subsample of training data.
-  Keep the seed-controlled subsample logic intact so evaluation is meaningful.
+- Can use numpy, scipy, scikit-learn, and torch (if available).
+- **Each experiment SEED is an independent data world.** The dataset you receive is one
+  realization; the loop evaluates you across several. A change is kept only if it helps
+  *consistently across worlds*, so avoid tricks that fit one particular draw.
 
 ## Data Structure
-The dataset (`PerturbationDataset`) has these fields you can use:
+The dataset (`PerturbationDataset`) exposes these fields:
 
 | Field | Type | Description |
 |---|---|---|
-| `ctrl_expr` | ndarray (n_samples × n_genes) | Control expression per cell |
-| `pert_expr` | ndarray (n_samples × n_genes) | Perturbed expression per cell |
+| `ctrl_expr` | ndarray (n_cells × n_genes) | Control expression per cell |
+| `pert_expr` | ndarray (n_cells × n_genes) | Perturbed expression per cell (target) |
 | `pert_names` | list[str] | Perturbation name per cell |
 | `cell_types` | list[str] | "K562" or "HeLa" per cell |
-| `pert_features` | dict[str, dict] | **Per-perturbation features for generalization** |
-| `gene_pathway` | ndarray (n_genes,) | Pathway ID for each gene |
-| `n_pathways` | int | Total number of pathways |
+| `pert_features` | dict[str, dict] | Per-perturbation features, for ALL perturbations |
+| `gene_pathway` | ndarray (n_genes,) | Pathway id per gene |
+| `n_pathways` | int | Number of pathways |
 | `deg_indices` | dict[str, ndarray] | Top-20 DEG indices per perturbation |
+| `train_idx` / `val_idx` / `test_idx` | ndarray | Split indices (`val_idx` = selection split) |
 
 ### Perturbation Features (`pert_features[pert_name]`)
-Each perturbation has features available for ALL perturbations (including unseen ones):
-- `"target_genes"`: ndarray of gene indices directly targeted by this perturbation
-- `"pathway"`: int, the pathway ID of the primary target gene
-
-These features are the key to generalizing to unseen perturbations.
+Available for every perturbation, **including unseen ones**:
+- `"target_genes"`: gene indices directly targeted by this perturbation
+- `"pathway"`: pathway id of the primary target
 
 ## Data Split (Hybrid)
-The split tests two abilities:
-1. **Seen perturbations with held-out cells** — can the model predict better per-cell
-   than the mean delta? (Tests expression-dependent modeling)
-2. **Unseen perturbations with features** — can the model generalize to new perturbations
-   using target gene and pathway features? (Tests feature-based transfer)
+The split tests two distinct abilities:
+1. **Seen perturbations, held-out cells** — can you predict better *per cell* than a
+   single average delta? (Tests cell-level modeling.)
+2. **Unseen perturbations** — cells for some perturbations appear only in val/test. You
+   never saw their expression during training, but you DO have their `target_genes` and
+   `pathway`. (Tests feature-based transfer.)
 
-- 50% of perturbations: train-only (all cells in training set)
-- 20% of perturbations: seen-split (cells divided 70/15/15 across train/val/test)
-- 30% of perturbations: unseen (all cells in val or test only, with features available)
+Composition: ~50% of perturbations are train-only, ~20% are seen-split (cells divided
+across train/val/test), ~30% are unseen (val/test only, with features available).
 
 ## Metric Specifications
-- **pearson_deg** [PRIMARY]: Per-cell Pearson correlation on **predicted delta vs true delta**
-  (pred - ctrl vs truth - ctrl) on top-20 DEGs. Higher is better. This directly measures
-  whether the model captures the perturbation effect pattern per cell.
-- **mse_top20_deg** [GUARD]: Per-cell MSE on top-20 DEGs. Must not degrade >10%.
-- **direction_acc** [GUARD]: Up/down direction accuracy. Must stay >0.7.
-- **cross_context** [BONUS]: Generalization gap across cell types. Lower is better.
+- **pearson_deg** [PRIMARY]: per-cell Pearson correlation between predicted delta and
+  true delta on top-20 DEGs. Higher is better.
+- **mse_top20_deg** [GUARD]: per-cell MSE on top-20 DEGs. Must not degrade materially.
+- **direction_acc** [GUARD]: up/down direction accuracy on DEGs.
+- **cross_context** [BONUS]: generalization gap across cell types. Lower is better.
 - **pearson_all** [DIAGNOSTIC]: Pearson on all genes (absolute values). Reported only.
 
-## Why the Baseline is Suboptimal
-The linear baseline uses `ctrl + mean_delta[pert_name]` for seen perturbations and
-`ctrl + global_mean_delta` for unseen. It scores ~0.19 on pearson_deg. It misses:
+## Where the Headroom Is (levers, not answers)
+The starting baseline predicts `ctrl + mean_delta[pert]` for seen perturbations and
+`ctrl + global_mean_delta` for unseen ones. It leaves large, *measurable* headroom — the
+harness can report the gap between this floor and a mechanism-aware oracle. The levers
+that are known to matter, which the baseline ignores, are:
 
-1. **Expression-dependent effects**: The perturbation effect on each gene scales with the
-   cell's control expression level (via tanh modulation). Cells with high ctrl expression
-   for a target gene respond more strongly. The baseline ignores this → suboptimal per-cell.
+1. **Perturbation features for unseen perts.** The baseline falls back to one global
+   delta for every unseen perturbation. `target_genes` and `pathway` let you predict a
+   perturbation-specific effect instead. This is the largest single source of headroom.
+2. **Per-cell variation.** The true delta is not identical across cells of the same
+   perturbation — it depends on the cell's state. A model that predicts one delta per
+   perturbation leaves per-cell signal on the table. What the dependence *is* is for you
+   to learn from the training split.
+3. **Cell type.** `cell_types` is available; responses are not identical across types.
+4. **Pathway / gene structure.** `gene_pathway` groups genes; effects are not independent
+   across genes in related pathways.
 
-2. **Cell-type-specific responses**: K562 and HeLa cells respond with different magnitudes
-   (1.0x vs 0.6x scaling). The baseline ignores cell type → noisy predictions.
-
-3. **Perturbation features for unseen perts**: Each perturbation has known target genes and
-   pathway. Models that use these can predict perturbation-specific effects for unseen perts
-   instead of falling back to `global_mean_delta`. This is the largest source of headroom.
-
-4. **Pathway propagation**: Perturbation effects propagate to secondary genes in the same
-   pathway (at 0.3x dampening). Models that learn pathway structure can predict these
-   secondary effects.
+You are expected to *discover* the functional relationships from the training data — they
+are deliberately not written down here. Form a hypothesis, implement it, and let the
+cross-world evaluation tell you whether it generalizes.
 
 ## Strategy Guidelines
-1. The biggest improvement comes from **using perturbation features for unseen perturbations**.
-   The baseline gets ~0.08 pearson_deg on unseen perts. Using target genes and pathway can
-   push this to 0.5+.
-2. For seen perturbations (baseline ~0.79), learn **expression-dependent delta mapping** —
-   predict different deltas for cells with different ctrl expression levels.
-3. Condition on **cell type** (available in `dataset.cell_types`) for per-cell-type deltas.
-4. Use **gene pathway structure** (`dataset.gene_pathway`) to model secondary effects.
-5. Pathway-based transfer: perturbations targeting the same pathway have shared effects.
-   Use `dataset.pert_features[pname]["pathway"]` to group perturbations.
-6. Don't get stuck on regularization variants — if 3 attempts fail, switch approach families.
-7. The data has nonlinear structure. MLP/neural approaches for `f(ctrl, pert_features) → delta`
-   are worth trying.
-8. Make one focused change per iteration. Don't combine unrelated ideas.
-
-## Knowledge Menu
-You have access to these biological priors (via `knowledge.retrieval.BioKnowledge`):
-
-| Source | Dims | What It Captures |
-|---|---|---|
-| gene_text_emb | 768 | Functional gene descriptions |
-| gene_ontology | 128 | Functional categories (GO graph) |
-| ppi_network | sparse | Protein-protein interactions (STRING) |
-| pathway_membership | N×P | Gene-pathway links (Reactome) |
-| esm_structure | 1280 | Protein 3D structure (ESM-2) |
-| drug_target | D×N | Drug binding data (ChEMBL) |
+1. Prioritize generalizing to **unseen perturbations** via their features — that is where
+   the baseline is weakest and the headroom is largest.
+2. For seen perturbations, try to beat the single-mean-delta prediction with a per-cell
+   model conditioned on control expression and/or cell type.
+3. Make **one focused change per iteration**; don't combine unrelated ideas.
+4. If a family of approaches (e.g. regularization variants) fails a few times, switch to a
+   fundamentally different direction rather than tuning the same idea.

@@ -151,6 +151,44 @@ class TestMoleculesDomain:
         assert 0 <= metrics["composite_admet"] <= 1.0
 
 
+class TestMoleculesValidity:
+    """Guards for the Phase-2 rebuild: the synthetic ADMET task must have real signal."""
+
+    def test_random_predictor_scores_near_chance(self):
+        """A random predictor must NOT score ~0.65 (the old null-task artifact)."""
+        from domains.molecules.prepare import (
+            SyntheticAdapter, evaluate, _ENDPOINT_NAMES, _ENDPOINT_TYPES)
+
+        d = SyntheticAdapter().load(0)
+        rng = np.random.RandomState(7)
+        preds = rng.randn(len(d.test_idx), 22).astype(np.float32)
+        comp = evaluate(preds, d.labels[d.test_idx], _ENDPOINT_NAMES, _ENDPOINT_TYPES)["composite_admet"]
+        assert comp < 0.45, f"random predictor scored {comp}: composite is still gameable"
+
+    def test_signal_is_learnable(self):
+        """A simple model trained on fingerprints must beat chance by a real margin."""
+        from domains.molecules.prepare import (
+            SyntheticAdapter, evaluate, _ENDPOINT_NAMES, _ENDPOINT_TYPES)
+        from sklearn.linear_model import Ridge
+
+        d = SyntheticAdapter().load(0)
+        preds = np.zeros((len(d.test_idx), 22), dtype=np.float32)
+        Xtr, Xte = d.fingerprints[d.train_idx], d.fingerprints[d.test_idx]
+        for j in range(22):
+            ytr = d.labels[d.train_idx, j]
+            m = ~np.isnan(ytr)
+            model = Ridge(alpha=1.0).fit(Xtr[m], ytr[m])
+            preds[:, j] = model.predict(Xte)
+        comp = evaluate(preds, d.labels[d.test_idx], _ENDPOINT_NAMES, _ENDPOINT_TYPES)["composite_admet"]
+        assert comp > 0.55, f"learned model only scored {comp}: no learnable signal"
+
+    def test_oracle_ceiling_above_floor(self):
+        from domains.molecules.prepare import SyntheticAdapter
+
+        rep = SyntheticAdapter().oracle_ceiling(0)["composite_admet"]
+        assert rep.oracle > rep.floor + 0.15, (rep.floor, rep.oracle)
+
+
 class TestTrialsDomain:
     def test_synthetic_data_loads(self):
         from domains.trials.prepare import load_data
@@ -196,3 +234,174 @@ class TestTrialsDomain:
         preds = np.array([0.9, 0.8, 0.7, 0.1, 0.2])  # Good predictions
         metrics = evaluate(preds, labels)
         assert metrics["net_value"] > 0  # Should make money
+
+
+class TestPerturbationValidity:
+    """Guards for the Phase-2 honest-substrate rebuild of the perturbation task."""
+
+    def test_generator_hidden_from_agent(self):
+        """The data-generating mechanism must NOT appear in anything the agent sees."""
+        from pathlib import Path
+        from domains.perturbation.prepare import SyntheticAdapter
+
+        agent_visible = (
+            Path("domains/perturbation/prepare.py").read_text()
+            + Path("domains/perturbation/program.md").read_text()
+            + SyntheticAdapter().describe_schema()
+        )
+        # These are constants/phrases from the true generative mechanism.
+        for banned in ("tanh", "0.3x", "push this to", "0.5+"):
+            assert banned not in agent_visible, f"generator leak: '{banned}' is agent-visible"
+        # ...but the mechanism really does exist, hidden away.
+        assert "tanh" in Path("domains/perturbation/_generator.py").read_text()
+
+    def test_oracle_ceiling_above_floor(self):
+        """The oracle must beat the floor, giving the agent real, measurable headroom."""
+        from domains.perturbation.prepare import SyntheticAdapter
+
+        ceiling = SyntheticAdapter().oracle_ceiling(world_seed=0)
+        assert "pearson_deg" in ceiling
+        rep = ceiling["pearson_deg"]
+        assert rep.oracle > rep.floor + 0.2, (rep.floor, rep.oracle)
+        # Floor captures 0% of headroom; oracle captures 100%.
+        assert abs(rep.fraction_captured(rep.floor)) < 1e-9
+        assert abs(rep.fraction_captured(rep.oracle) - 1.0) < 1e-9
+        # Lower-is-better metric has oracle below floor.
+        assert ceiling["mse_top20_deg"].oracle < ceiling["mse_top20_deg"].floor
+
+    def test_multi_world_generalization_variance(self):
+        """Different world seeds are genuinely different data draws (not one fixed world)."""
+        from domains.perturbation.prepare import SyntheticAdapter
+
+        adapter = SyntheticAdapter()
+        w0 = adapter.load(0)
+        w1 = adapter.load(1)
+        # Same schema/shape...
+        assert w0.ctrl_expr.shape == w1.ctrl_expr.shape
+        # ...but different underlying data (control expression differs across worlds).
+        assert not np.array_equal(w0.ctrl_expr, w1.ctrl_expr)
+        # And different target-gene assignments for the same perturbation name.
+        t0 = w0.pert_features["PERT_000"]["target_genes"]
+        t1 = w1.pert_features["PERT_000"]["target_genes"]
+        assert not (len(t0) == len(t1) and np.array_equal(np.sort(t0), np.sort(t1)))
+
+    def test_splits_are_leakage_free(self):
+        """The explicit split contract must be disjoint across train/select/test."""
+        from domains.perturbation.prepare import SyntheticAdapter
+
+        d = SyntheticAdapter().load(0)
+        assert d.splits is not None
+        d.splits.validate(n_samples=d.n_samples)  # raises on any overlap
+        # val_idx is the select split (backward-compatible alias).
+        assert np.array_equal(np.sort(d.val_idx), np.sort(d.splits.select_idx))
+
+
+class TestTrialsValidity:
+    """Guards for the Phase-2 rebuild of the trials task."""
+
+    def test_signal_is_learnable(self):
+        from domains.trials.prepare import SyntheticAdapter, evaluate
+        from sklearn.linear_model import LogisticRegression
+
+        d = SyntheticAdapter().load(0)
+        clf = LogisticRegression(max_iter=500).fit(d.features[d.train_idx], d.labels[d.train_idx])
+        preds = clf.predict_proba(d.features[d.test_idx])[:, 1]
+        phases = [d.phases[i] for i in d.test_idx]
+        auroc = evaluate(preds, d.labels[d.test_idx], phases)["auroc"]
+        assert auroc > 0.58, f"trials AUROC only {auroc}: signal too weak"
+
+    def test_oracle_ceiling_above_floor(self):
+        from domains.trials.prepare import SyntheticAdapter
+
+        rep = SyntheticAdapter().oracle_ceiling(0)["auroc"]
+        assert rep.oracle > rep.floor + 0.1, (rep.floor, rep.oracle)
+
+    def test_cross_domain_extraction_does_not_crash(self):
+        """Regression guard for the dead `pert_embeddings` chain (Tier-5 bug)."""
+        from domains.trials.train import extract_perturbation_features
+
+        result = extract_perturbation_features(["DRUG_0"], [["TARGET_1"]])
+        # Must return cleanly (ndarray or None) — never raise AttributeError.
+        assert result is None or hasattr(result, "shape")
+
+
+class TestNegativeControl:
+    """The calibration task must be genuinely signal-free (oracle == floor)."""
+
+    def test_zero_headroom(self):
+        from domains.negative_control.prepare import SyntheticAdapter
+
+        rep = SyntheticAdapter().oracle_ceiling(0)["accuracy"]
+        # By construction there is nothing to learn: the best predictor is the base rate.
+        assert abs(rep.oracle - rep.floor) < 1e-9
+
+    def test_labels_independent_of_features(self):
+        from domains.negative_control.prepare import SyntheticAdapter, evaluate
+        from sklearn.linear_model import LogisticRegression
+
+        d = SyntheticAdapter().load(0)
+        clf = LogisticRegression(max_iter=200).fit(d.features[d.train_idx], d.labels[d.train_idx])
+        preds = clf.predict_proba(d.features[d.test_idx])[:, 1]
+        acc = evaluate(preds, d.labels[d.test_idx])["accuracy"]
+        # A trained model must not meaningfully beat chance on held-out data.
+        assert acc < 0.6, f"negative control leaked signal (acc={acc})"
+
+
+class TestRealMoleculesADMET:
+    """Phase-3 real TDC ADMET adapter (skips cleanly when deps/data are absent)."""
+
+    def test_scaffold_split_partitions_by_whole_scaffold(self):
+        pytest.importorskip("rdkit")
+        from domains.molecules.prepare import _scaffold_split
+
+        smis = ["c1ccccc1CCO", "c1ccccc1CC", "c1ccccc1C(=O)O", "C1CCCCC1", "C1CCCCC1CC",
+                "CCO", "CCCO", "c1ccncc1", "c1ccncc1C", "c1ccncc1CC"]
+        tr, se, te = _scaffold_split(smis, frac_train=0.6, frac_select=0.2)
+        idx = set(map(int, tr)) | set(map(int, se)) | set(map(int, te))
+        assert idx == set(range(len(smis)))                 # every molecule placed once
+        assert not (set(map(int, tr)) & set(map(int, te)))  # disjoint splits
+
+    def test_real_admet_loads_with_signal_if_cached(self):
+        pytest.importorskip("tdc")
+        pytest.importorskip("rdkit")
+        import os
+        from pathlib import Path
+
+        base = Path(os.path.expanduser("~/.cache/bioresearch/molecules"))
+        if not ((base / "admet_processed.npz").exists() or (base / "admet_group").exists()):
+            pytest.skip("TDC ADMET data not downloaded")
+
+        from domains.molecules.prepare import RealAdapter
+
+        d = RealAdapter().load()
+        assert len(d.smiles) > 1000
+        assert d.splits is not None
+        d.splits.validate(n_samples=len(d.smiles))
+        assert np.isfinite(d.labels).any()       # real labels present
+        assert float(d.fingerprints.sum()) > 0   # real, non-zero fingerprints
+
+
+class TestRealPerturbationNorman:
+    """Phase-3 real Norman 2019 adapter (skips cleanly when data isn't downloaded)."""
+
+    def test_real_norman_loads_if_cached(self):
+        import os
+        from pathlib import Path
+
+        cache = (Path(os.path.expanduser("~/.cache/bioresearch/perturbation"))
+                 / "norman_2019_processed.npz")
+        if not cache.exists():
+            pytest.skip("Norman 2019 not downloaded/processed")
+
+        from domains.perturbation.prepare import RealAdapter
+
+        d = RealAdapter(dataset_name="norman_2019").load()
+        assert d.n_samples > 1000
+        assert d.splits is not None
+        d.splits.validate(n_samples=d.n_samples)
+        # Real per-perturbation target genes exist for at least some perturbations.
+        assert any(len(f["target_genes"]) > 0 for f in d.pert_features.values())
+        # The hybrid split really holds out unseen perturbations.
+        train_perts = set(d.pert_names[i] for i in d.train_idx)
+        val_perts = set(d.pert_names[i] for i in d.val_idx)
+        assert len(val_perts - train_perts) > 0

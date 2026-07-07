@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+from domains.base import CeilingReport, DataAdapter, Splits
+from domains.molecules._generator import GeneratedMolWorld, generate_world
+
 SEED = int(os.environ.get("SEED", "42"))
+# Synthetic ADMET is multi-world: each experiment SEED selects an independent data
+# realization (see the hidden domains/molecules/_generator.py).
+WORLD_SEED = int(os.environ.get("WORLD_SEED", str(SEED)))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "600"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.expanduser("~/.cache/bioresearch/molecules"))
 
@@ -81,58 +88,128 @@ class MoleculeDataset:
     train_idx: np.ndarray
     val_idx: np.ndarray
     test_idx: np.ndarray
+    # Validity-harness additions (populated for synthetic worlds):
+    splits: Optional[Splits] = None
+    ceiling: Optional[dict] = None
 
 
-def load_data(use_tdc: bool = True) -> MoleculeDataset:
-    """Load ADMET benchmark data."""
+_ENDPOINT_NAMES = list(ADMET_ENDPOINTS.keys())
+_ENDPOINT_TYPES = [ADMET_ENDPOINTS[e]["type"] for e in _ENDPOINT_NAMES]
+
+# Agent-facing schema description (shown in the prompt instead of the data generator).
+_SCHEMA_DOC = """\
+ADMET dataset schema (fields on the object returned by load_data):
+
+  fingerprints  float32 [n_molecules, fp_dim]  molecular feature vectors (INPUT)
+  labels        float32 [n_molecules, 22]       endpoint values; NaN where missing (TARGET)
+  endpoint_names list[str]                       the 22 ADMET endpoint names
+  endpoint_types list[str]                       "classification" or "regression" per endpoint
+  smiles        list[str]                        molecule identifiers
+  train_idx / val_idx / test_idx                 split indices (val_idx = selection split)
+
+Objective (frozen, see `evaluate`): composite_admet = clinically-weighted average over
+endpoints of AUROC (classification) and rank correlation clipped at chance (regression).
+Predicting the per-endpoint mean scores ~0 on that composite — you are rewarded only for
+genuinely ranking molecules. Endpoints share latent structure, so multi-task modelling
+and nonlinear feature maps help; the exact input->label relationship is for you to learn.
+"""
+
+
+def _dataset_from_world(world: GeneratedMolWorld) -> MoleculeDataset:
+    splits = Splits(world.train_idx, world.select_idx, world.test_idx, meta=world.split_meta)
+    splits.validate(n_samples=world.fingerprints.shape[0])
+    return MoleculeDataset(
+        smiles=world.smiles,
+        labels=world.labels,
+        endpoint_names=_ENDPOINT_NAMES,
+        endpoint_types=_ENDPOINT_TYPES,
+        fingerprints=world.fingerprints,
+        train_idx=world.train_idx,
+        val_idx=world.select_idx,   # `val_idx` retained as an alias for the select split
+        test_idx=world.test_idx,
+        splits=splits,
+    )
+
+
+def load_data(use_tdc: bool = True, world_seed: Optional[int] = None) -> MoleculeDataset:
+    """Load ADMET data via the appropriate adapter.
+
+    use_tdc=False -> multi-world synthetic (default for the loop/CI); `world_seed` selects
+    the world and defaults to the experiment SEED. use_tdc=True -> real TDC data (Phase 3),
+    falling back to synthetic if TDC/rdkit are unavailable.
+    """
+    ws = WORLD_SEED if world_seed is None else world_seed
+    if not use_tdc:
+        return SyntheticAdapter().load(ws)
+
     cache_path = Path(DATA_DIR) / "admet_processed.npz"
     if cache_path.exists():
         return _load_cached(cache_path)
-
-    if use_tdc:
-        try:
-            return _load_tdc(cache_path)
-        except (ImportError, Exception) as e:
-            print(f"TDC loading failed ({e}), using synthetic data.")
-
-    return _make_synthetic_dataset()
+    try:
+        return RealAdapter().load(ws)
+    except Exception as e:
+        print(f"TDC loading failed ({e}), using synthetic data.")
+        return SyntheticAdapter().load(ws)
 
 
-def _make_synthetic_dataset(n_samples: int = 2000, fp_dim: int = 256) -> MoleculeDataset:
-    """Create synthetic ADMET data for testing."""
-    rng = np.random.RandomState(SEED)
+def _make_synthetic_dataset(n_samples: int = 2000, fp_dim: int = 256,
+                            world_seed: Optional[int] = None, **_legacy) -> MoleculeDataset:
+    """Build a synthetic ADMET dataset for one world (thin wrapper over the hidden generator)."""
+    ws = WORLD_SEED if world_seed is None else world_seed
+    world = generate_world(ws, _ENDPOINT_TYPES, n_samples=n_samples, fp_dim=fp_dim)
+    return _dataset_from_world(world)
 
-    endpoint_names = list(ADMET_ENDPOINTS.keys())
-    endpoint_types = [ADMET_ENDPOINTS[e]["type"] for e in endpoint_names]
 
-    smiles = [f"C{'C' * rng.randint(1, 20)}O{'=' * rng.randint(0, 2)}N" for _ in range(n_samples)]
-    # Continuous fingerprints for synthetic data (binary can cause numerical issues in Ridge)
-    fingerprints = rng.randn(n_samples, fp_dim).astype(np.float32) * 0.1
+class SyntheticAdapter(DataAdapter):
+    """Multi-world synthetic ADMET data with genuine input->label signal and a ceiling."""
 
-    labels = np.zeros((n_samples, N_ENDPOINTS), dtype=np.float32)
-    for j, etype in enumerate(endpoint_types):
-        if etype == "classification":
-            labels[:, j] = rng.randint(0, 2, n_samples).astype(np.float32)
-        else:
-            labels[:, j] = rng.randn(n_samples).astype(np.float32)
-        # Add 10% missing values
-        missing = rng.choice(n_samples, n_samples // 10, replace=False)
-        labels[missing, j] = np.nan
+    is_synthetic = True
 
-    indices = rng.permutation(n_samples)
-    n_train = int(n_samples * 0.7)
-    n_val = int(n_samples * 0.15)
+    def __init__(self, fp_dim: int = 256):
+        self.fp_dim = fp_dim
+        self.name = "molecules:synthetic"
 
-    return MoleculeDataset(
-        smiles=smiles,
-        labels=labels,
-        endpoint_names=endpoint_names,
-        endpoint_types=endpoint_types,
-        fingerprints=fingerprints,
-        train_idx=indices[:n_train],
-        val_idx=indices[n_train:n_train + n_val],
-        test_idx=indices[n_train + n_val:],
-    )
+    def load(self, world_seed: int = 0) -> MoleculeDataset:
+        return _make_synthetic_dataset(fp_dim=self.fp_dim, world_seed=world_seed)
+
+    def describe_schema(self) -> str:
+        return _SCHEMA_DOC
+
+    def oracle_ceiling(self, world_seed: int = 0, split: str = "select") -> dict:
+        """composite_admet floor (per-endpoint mean predictor) and oracle (noise-free labels)."""
+        world = generate_world(world_seed, _ENDPOINT_TYPES)
+        idx = world.select_idx if split == "select" else world.test_idx
+        labels = world.labels[idx]
+
+        m_oracle = evaluate(world.labels_clean[idx], labels, _ENDPOINT_NAMES, _ENDPOINT_TYPES)
+        floor_vec = np.nan_to_num(np.nanmean(world.labels[world.train_idx], axis=0))
+        floor_pred = np.tile(floor_vec, (len(idx), 1)).astype(np.float32)
+        m_floor = evaluate(floor_pred, labels, _ENDPOINT_NAMES, _ENDPOINT_TYPES)
+
+        reports = {}
+        if "composite_admet" in m_oracle and "composite_admet" in m_floor:
+            reports["composite_admet"] = CeilingReport(
+                metric="composite_admet",
+                floor=float(m_floor["composite_admet"]),
+                oracle=float(m_oracle["composite_admet"]),
+                higher_is_better=True,
+            )
+        return reports
+
+
+class RealAdapter(DataAdapter):
+    """Real TDC ADMET benchmark (22 endpoints). Fully wired in Phase 3."""
+
+    is_synthetic = False
+
+    def __init__(self):
+        self.name = "molecules:tdc_admet"
+
+    def load(self, world_seed: int = 0) -> MoleculeDataset:
+        cache_path = Path(DATA_DIR) / "admet_processed.npz"
+        if cache_path.exists():
+            return _load_cached(cache_path)
+        return _load_tdc(cache_path)
 
 
 def _load_tdc(cache_path: Path) -> MoleculeDataset:
@@ -169,16 +246,21 @@ def _load_tdc(cache_path: Path) -> MoleculeDataset:
             for split_data in [endpoint_data[endpoint_name]["train"], endpoint_data[endpoint_name]["test"]]:
                 for smi, val in split_data.items():
                     if smi in smiles_to_idx:
-                        labels[smiles_to_idx[smi], j] = val
+                        try:
+                            labels[smiles_to_idx[smi], j] = float(val)
+                        except (TypeError, ValueError):
+                            pass
 
-    # Compute fingerprints
+    # Real Morgan fingerprints (rdkit).
     fingerprints = _compute_fingerprints(smiles_list)
 
-    # Use TDC standard splits
-    rng = np.random.RandomState(SEED)
-    indices = rng.permutation(n_samples)
-    n_train = int(n_samples * 0.7)
-    n_val = int(n_samples * 0.15)
+    # Scaffold split: whole Bemis-Murcko scaffolds are assigned to a single split, so the
+    # test set contains chemical scaffolds never seen in training — the standard "hard"
+    # ADMET generalization split, not a random shuffle.
+    train_idx, select_idx, test_idx = _scaffold_split(smiles_list)
+    splits = Splits(train_idx, select_idx, test_idx,
+                    meta={"split": "scaffold", "n_molecules": n_samples})
+    splits.validate(n_samples=n_samples)
 
     dataset = MoleculeDataset(
         smiles=smiles_list,
@@ -186,13 +268,46 @@ def _load_tdc(cache_path: Path) -> MoleculeDataset:
         endpoint_names=endpoint_names,
         endpoint_types=endpoint_types,
         fingerprints=fingerprints,
-        train_idx=indices[:n_train],
-        val_idx=indices[n_train:n_train + n_val],
-        test_idx=indices[n_train + n_val:],
+        train_idx=train_idx,
+        val_idx=select_idx,   # `val_idx` retained as an alias for the select split
+        test_idx=test_idx,
+        splits=splits,
     )
 
     _save_cached(dataset, cache_path)
     return dataset
+
+
+def _scaffold_split(smiles_list: list[str], frac_train: float = 0.7,
+                    frac_select: float = 0.15):
+    """Bemis-Murcko scaffold split (DeepChem-style): largest scaffold groups fill train
+    first, so held-out splits contain unseen scaffolds. Deterministic (real data = 1 world).
+    """
+    from collections import defaultdict
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, smi in enumerate(smiles_list):
+        try:
+            scaf = MurckoScaffold.MurckoScaffoldSmiles(smiles=smi, includeChirality=False)
+        except Exception:
+            scaf = ""
+        groups[scaf].append(i)
+
+    ordered = sorted(groups.values(), key=lambda g: (-len(g), g[0]))
+    n = len(smiles_list)
+    n_train, n_select = int(n * frac_train), int(n * frac_select)
+    train: list[int] = []
+    select: list[int] = []
+    test: list[int] = []
+    for g in ordered:
+        if len(train) + len(g) <= n_train:
+            train.extend(g)
+        elif len(select) + len(g) <= n_select:
+            select.extend(g)
+        else:
+            test.extend(g)
+    return (np.array(sorted(train)), np.array(sorted(select)), np.array(sorted(test)))
 
 
 def _compute_fingerprints(smiles_list: list[str], fp_dim: int = 2048) -> np.ndarray:
@@ -244,6 +359,7 @@ def _load_cached(path: Path) -> MoleculeDataset:
         train_idx=data["train_idx"],
         val_idx=data["val_idx"],
         test_idx=data["test_idx"],
+        splits=Splits(data["train_idx"], data["val_idx"], data["test_idx"], meta={"cached": True}),
     )
 
 
@@ -303,14 +419,19 @@ def evaluate(
             metrics[f"{name}_mae"] = mae
 
             try:
-                rho, _ = sp_stats.spearmanr(pred, true)
+                with warnings.catch_warnings():
+                    # A constant prediction column (e.g. the floor predictor) makes
+                    # Spearman undefined; that is expected and handled as rho=0.
+                    warnings.simplefilter("ignore")
+                    rho, _ = sp_stats.spearmanr(pred, true)
                 if np.isnan(rho):
                     rho = 0.0
                 metrics[f"{name}_spearman"] = rho
-                # For regression: use 1 - normalized MAE as contribution to composite
-                max_range = np.ptp(true) if np.ptp(true) > 0 else 1.0
-                normalized_score = max(0, 1 - mae / max_range)
-                weighted_sum += normalized_score * weight
+                # Composite uses rank correlation clipped at chance (0). A mean-predictor
+                # scores 0 here. The previous `1 - mae/range` term rewarded predicting the
+                # mean, which made composite_admet ~0.65 even on pure-noise data — the
+                # artifact that let the loop "keep" false positives on the null task.
+                weighted_sum += max(0.0, rho) * weight
                 total_weight += weight
             except Exception:
                 metrics[f"{name}_spearman"] = 0.0
@@ -399,9 +520,14 @@ if __name__ == "__main__":
     dataset = load_data(use_tdc=False)
     print(f"Dataset: {len(dataset.smiles)} molecules, {N_ENDPOINTS} endpoints")
 
-    # Test with random predictions
+    # Random predictions should now score ~0 on the composite (chance-anchored).
     rng = np.random.RandomState(42)
     predictions = rng.randn(len(dataset.test_idx), N_ENDPOINTS).astype(np.float32)
     labels = dataset.labels[dataset.test_idx]
     metrics = evaluate(predictions, labels, dataset.endpoint_names, dataset.endpoint_types)
-    print(f"Composite ADMET (random): {metrics['composite_admet']:.4f}")
+    print(f"Composite ADMET (random predictions): {metrics['composite_admet']:.4f}")
+
+    ceiling = SyntheticAdapter().oracle_ceiling(world_seed=WORLD_SEED)
+    if "composite_admet" in ceiling:
+        c = ceiling["composite_admet"]
+        print(f"Composite ADMET ceiling: floor={c.floor:.4f} -> oracle={c.oracle:.4f}")

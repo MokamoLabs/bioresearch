@@ -201,9 +201,11 @@ def main():
     prediction_time = time.time() - t_start
     print(f"Prediction model training: {prediction_time:.1f}s")
 
-    # Evaluate prediction
-    val_fp = dataset.fingerprints[dataset.val_idx]
-    val_labels = dataset.labels[dataset.val_idx]
+    # Evaluate on the selection split by default; loop sets EVAL_SPLIT=test for the
+    # one-shot locked-test evaluation of a committed model. Keep this line intact.
+    eval_idx = dataset.test_idx if os.environ.get("EVAL_SPLIT") == "test" else dataset.val_idx
+    val_fp = dataset.fingerprints[eval_idx]
+    val_labels = dataset.labels[eval_idx]
     predictions = model.predict(val_fp)
     pred_metrics = evaluate(predictions, val_labels, dataset.endpoint_names, dataset.endpoint_types)
 

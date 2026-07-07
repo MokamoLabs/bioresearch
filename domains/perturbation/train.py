@@ -106,11 +106,13 @@ def main():
     train_time = time.time() - t_start
     print(f"Training time: {train_time:.1f}s")
 
-    # Evaluate on validation set
-    val_ctrl = dataset.ctrl_expr[dataset.val_idx]
-    val_pert = dataset.pert_expr[dataset.val_idx]
-    val_names = [dataset.pert_names[i] for i in dataset.val_idx]
-    val_cell_types = [dataset.cell_types[i] for i in dataset.val_idx]
+    # Evaluate on the selection split by default; the loop sets EVAL_SPLIT=test for the
+    # one-shot locked-test evaluation of a committed model. Keep this line intact.
+    eval_idx = dataset.test_idx if os.environ.get("EVAL_SPLIT") == "test" else dataset.val_idx
+    val_ctrl = dataset.ctrl_expr[eval_idx]
+    val_pert = dataset.pert_expr[eval_idx]
+    val_names = [dataset.pert_names[i] for i in eval_idx]
+    val_cell_types = [dataset.cell_types[i] for i in eval_idx]
 
     predictions = model.predict(val_ctrl, val_names)
 

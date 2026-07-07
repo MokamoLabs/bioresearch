@@ -95,8 +95,11 @@ def extract_perturbation_features(drug_smiles: list[str], target_names: list[lis
         for i, targets in enumerate(target_names):
             deltas = []
             for target in targets:
-                if target in model.pert_embeddings:
-                    deltas.append(model.pert_embeddings[target])
+                # LinearPerturbModel stores per-perturbation mean deltas in `pert_deltas`
+                # (the previous `pert_embeddings` attribute never existed, so this whole
+                # function silently crashed on every run).
+                if target in model.pert_deltas:
+                    deltas.append(model.pert_deltas[target])
             if deltas:
                 # Average perturbation effect across targets
                 avg_delta = np.mean(deltas, axis=0)
@@ -174,21 +177,15 @@ def main():
     print(f"Dataset: {len(dataset.labels)} trials, {dataset.features.shape[1]} base features")
     print(f"Success rate: {dataset.labels.mean():.1%}")
 
-    # --- Cross-project feature extraction ---
-    print("Extracting cross-project features...")
-    admet_features = extract_admet_features(dataset.drug_smiles)
-    pert_features = extract_perturbation_features(dataset.drug_smiles, dataset.target_names)
-
-    # Build combined feature matrix
-    feature_parts = [dataset.features]
-    if admet_features is not None:
-        feature_parts.append(admet_features)
-    if pert_features is not None:
-        feature_parts.append(pert_features)
-
-    combined_features = np.hstack(feature_parts)
-    n_extra = combined_features.shape[1] - dataset.features.shape[1]
-    print(f"Combined features: {combined_features.shape[1]} ({dataset.features.shape[1]} base + {n_extra} cross-project)")
+    # The base features already carry the outcome signal (drug properties, phase,
+    # enrollment). Cross-project enrichment (ADMET profiles from AutoMol, perturbation
+    # signatures from AutoPerturb) is only meaningful on REAL data, where drug/target
+    # identities map across domains — on synthetic data the identities are random, so the
+    # extractors return noise. The (now-fixed) `extract_admet_features` /
+    # `extract_perturbation_features` helpers remain available for the real-data path
+    # (Phase 3); a candidate is free to wire them in when running on real datasets.
+    combined_features = dataset.features
+    n_extra = 0
 
     # --- Train model ---
     train_features = combined_features[dataset.train_idx]
@@ -200,10 +197,12 @@ def main():
     train_time = time.time() - t_start
     print(f"Training time: {train_time:.1f}s")
 
-    # --- Evaluate on validation set ---
-    val_features = combined_features[dataset.val_idx]
-    val_labels = dataset.labels[dataset.val_idx]
-    val_phases = [dataset.phases[i] for i in dataset.val_idx]
+    # Evaluate on the selection split by default; loop sets EVAL_SPLIT=test for the
+    # one-shot locked-test evaluation of a committed model. Keep this line intact.
+    eval_idx = dataset.test_idx if os.environ.get("EVAL_SPLIT") == "test" else dataset.val_idx
+    val_features = combined_features[eval_idx]
+    val_labels = dataset.labels[eval_idx]
+    val_phases = [dataset.phases[i] for i in eval_idx]
 
     predictions = model.predict(val_features)
     metrics = evaluate(predictions, val_labels, val_phases)

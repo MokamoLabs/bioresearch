@@ -25,7 +25,13 @@ from typing import Optional
 
 import numpy as np
 
+from domains.base import CeilingReport, DataAdapter, Splits
+from domains.trials._generator import GeneratedTrialWorld, generate_world
+
 SEED = int(os.environ.get("SEED", "42"))
+# Synthetic trials are multi-world: each experiment SEED selects an independent data
+# realization (see the hidden domains/trials/_generator.py).
+WORLD_SEED = int(os.environ.get("WORLD_SEED", str(SEED)))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "600"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.expanduser("~/.cache/bioresearch/trials"))
 
@@ -57,65 +63,122 @@ class TrialDataset:
     train_idx: np.ndarray
     val_idx: np.ndarray
     test_idx: np.ndarray
+    # Validity-harness additions (populated for synthetic worlds):
+    splits: Optional[Splits] = None
+    ceiling: Optional[dict] = None
 
 
-def load_data(use_tdc: bool = True) -> TrialDataset:
-    """Load clinical trial data."""
+# Agent-facing schema description (shown in the prompt instead of the data generator).
+_SCHEMA_DOC = """\
+Clinical-trial dataset schema (fields on the object returned by load_data):
+
+  features      float32 [n_trials, n_features]  engineered trial/drug features (INPUT)
+  feature_names list[str]
+  phases        list[int]                       trial phase (1, 2, 3)
+  enrollment    list[int]                       patient count per trial
+  drug_smiles   list[str]                       drug identifiers
+  target_names  list[list[str]]                 target ids per trial
+  indications   list[str]                       disease indication
+  labels        float32 [n_trials]              outcome (1=success, 0=failure) (TARGET)
+  train_idx / val_idx / test_idx                temporal split (val_idx = selection split)
+
+Objective (frozen, see evaluate): auroc = ranking of successful vs failed trials, guarded
+by calibration (ECE) and net economic value. Success depends on the drug's properties (in
+the features), the trial phase, and enrollment, in ways you must learn from training data.
+"""
+
+
+def load_data(use_tdc: bool = True, world_seed: Optional[int] = None) -> TrialDataset:
+    """Load clinical-trial data via the appropriate adapter.
+
+    use_tdc=False -> multi-world synthetic (default); `world_seed` selects the world and
+    defaults to the experiment SEED. use_tdc=True -> real TDC/TrialBench (Phase 3), with
+    synthetic fallback if unavailable.
+    """
+    ws = WORLD_SEED if world_seed is None else world_seed
+    if not use_tdc:
+        return SyntheticAdapter().load(ws)
+
     cache_path = Path(DATA_DIR) / "trials_processed.npz"
     if cache_path.exists():
         return _load_cached(cache_path)
-
-    if use_tdc:
-        try:
-            return _load_tdc(cache_path)
-        except (ImportError, Exception) as e:
-            print(f"TDC loading failed ({e}), using synthetic data.")
-
-    return _make_synthetic_dataset()
+    try:
+        return RealAdapter().load(ws)
+    except Exception as e:
+        print(f"TDC loading failed ({e}), using synthetic data.")
+        return SyntheticAdapter().load(ws)
 
 
-def _make_synthetic_dataset(n_trials: int = 1000, n_features: int = 100) -> TrialDataset:
-    """Create synthetic clinical trial data."""
-    rng = np.random.RandomState(SEED)
-
-    phases = rng.choice([1, 2, 3], n_trials, p=[0.3, 0.4, 0.3]).tolist()
-    # Success rates by phase (realistic)
-    phase_success_rates = {1: 0.65, 2: 0.35, 3: 0.60}
-
-    labels = np.zeros(n_trials, dtype=np.float32)
-    features = rng.randn(n_trials, n_features).astype(np.float32)
-    drug_smiles = [f"C{'C' * rng.randint(1, 15)}O" for _ in range(n_trials)]
-    target_names = [[f"TARGET_{rng.randint(0, 50)}"] for _ in range(n_trials)]
-    indications = [rng.choice(["NSCLC", "breast_cancer", "AML", "melanoma", "glioblastoma"]) for _ in range(n_trials)]
-    enrollment = rng.randint(50, 5000, n_trials).tolist()
-
-    for i in range(n_trials):
-        base_rate = phase_success_rates[phases[i]]
-        # Features influence success probability
-        logit = np.log(base_rate / (1 - base_rate)) + 0.3 * features[i, :5].sum()
-        prob = 1 / (1 + np.exp(-logit))
-        labels[i] = 1.0 if rng.rand() < prob else 0.0
-
-    feature_names = [f"feat_{i}" for i in range(n_features)]
-
-    # Temporal split (simulate time ordering)
-    train_idx = np.arange(0, int(n_trials * 0.6))
-    val_idx = np.arange(int(n_trials * 0.6), int(n_trials * 0.8))
-    test_idx = np.arange(int(n_trials * 0.8), n_trials)
-
+def _dataset_from_world(world: GeneratedTrialWorld) -> TrialDataset:
+    splits = Splits(world.train_idx, world.select_idx, world.test_idx, meta=world.split_meta)
+    splits.validate(n_samples=world.features.shape[0])
     return TrialDataset(
-        drug_smiles=drug_smiles,
-        target_names=target_names,
-        indications=indications,
-        phases=phases,
-        enrollment=enrollment,
-        features=features,
-        feature_names=feature_names,
-        labels=labels,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
+        drug_smiles=world.drug_smiles,
+        target_names=world.target_names,
+        indications=world.indications,
+        phases=world.phases,
+        enrollment=world.enrollment,
+        features=world.features,
+        feature_names=world.feature_names,
+        labels=world.labels,
+        train_idx=world.train_idx,
+        val_idx=world.select_idx,   # `val_idx` retained as an alias for the select split
+        test_idx=world.test_idx,
+        splits=splits,
     )
+
+
+def _make_synthetic_dataset(n_trials: int = 1000, n_features: int = 100,
+                            world_seed: Optional[int] = None, **_legacy) -> TrialDataset:
+    """Build a synthetic trials dataset for one world (thin wrapper over hidden generator)."""
+    ws = WORLD_SEED if world_seed is None else world_seed
+    return _dataset_from_world(generate_world(ws, n_trials=n_trials, n_features=n_features))
+
+
+class SyntheticAdapter(DataAdapter):
+    """Multi-world synthetic trial-outcome data with a computable AUROC ceiling."""
+
+    is_synthetic = True
+
+    def __init__(self):
+        self.name = "trials:synthetic"
+
+    def load(self, world_seed: int = 0) -> TrialDataset:
+        return _make_synthetic_dataset(world_seed=world_seed)
+
+    def describe_schema(self) -> str:
+        return _SCHEMA_DOC
+
+    def oracle_ceiling(self, world_seed: int = 0, split: str = "select") -> dict:
+        """AUROC floor (base-rate predictor) and oracle (true success probability)."""
+        world = generate_world(world_seed)
+        idx = world.select_idx if split == "select" else world.test_idx
+        labels = world.labels[idx]
+        phases = [world.phases[i] for i in idx]
+
+        m_oracle = evaluate(world.labels_clean[idx], labels, phases)
+        base = float(world.labels[world.train_idx].mean())
+        m_floor = evaluate(np.full(len(idx), base, dtype=np.float32), labels, phases)
+
+        reports = {}
+        if "auroc" in m_oracle and "auroc" in m_floor:
+            reports["auroc"] = CeilingReport(
+                metric="auroc", floor=float(m_floor["auroc"]),
+                oracle=float(m_oracle["auroc"]), higher_is_better=True,
+            )
+        return reports
+
+
+class RealAdapter(DataAdapter):
+    """Real TDC / TrialBench clinical-trial data. Fully wired in Phase 3."""
+
+    is_synthetic = False
+
+    def __init__(self):
+        self.name = "trials:tdc"
+
+    def load(self, world_seed: int = 0) -> TrialDataset:
+        return _load_tdc(Path(DATA_DIR) / "trials_processed.npz")
 
 
 def _load_tdc(cache_path: Path) -> TrialDataset:

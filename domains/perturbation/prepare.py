@@ -27,19 +27,19 @@ from typing import Optional
 
 import numpy as np
 
-# Attempt to import bio-specific libraries, fall back gracefully
+from domains.base import CeilingReport, DataAdapter, Splits
+from domains.perturbation._generator import GeneratedWorld, generate_world, _hybrid_split
+
+# Attempt to import single-cell libraries, fall back gracefully. We catch broad
+# Exceptions (not just ImportError) because some optional stacks import but raise at
+# import time under version skew (e.g. pertpy -> jax vs numpy). The real Norman loader
+# needs only scanpy + anndata and downloads the h5ad directly (no pertpy).
 try:
     import scanpy as sc
     import anndata as ad
     HAS_SCANPY = True
-except ImportError:
+except Exception:
     HAS_SCANPY = False
-
-try:
-    import pertpy as pt
-    HAS_PERTPY = True
-except ImportError:
-    HAS_PERTPY = False
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SEED = int(os.environ.get("SEED", "42"))
-DATA_SEED = 42  # Fixed seed for data generation — never changes across experiment seeds
+# The synthetic task is MULTI-WORLD: each experiment SEED selects an independent data
+# realization (see the hidden domains/perturbation/_generator.py). There is no single
+# fixed data seed anymore — cross-seed variance now measures generalization across
+# worlds, not resampling of one fixed draw. WORLD_SEED can override for diagnostics.
+WORLD_SEED = int(os.environ.get("WORLD_SEED", str(SEED)))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "600"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.expanduser("~/.cache/bioresearch/perturbation"))
 N_TOP_DEGS = 20
@@ -84,6 +88,9 @@ class PerturbationDataset:
     gene_pathway: np.ndarray = field(default_factory=lambda: np.array([]))
     # gene_idx -> pathway_id
     n_pathways: int = 0
+    # Validity-harness additions (populated for synthetic worlds):
+    splits: Optional[Splits] = None        # explicit train/select/test contract
+    ceiling: Optional[dict] = None         # metric -> CeilingReport (achievable headroom)
 
     @property
     def n_genes(self) -> int:
@@ -94,276 +101,271 @@ class PerturbationDataset:
         return self.ctrl_expr.shape[0]
 
 
-def load_data(dataset_name: str = "norman_2019", n_genes: int = N_GENES) -> PerturbationDataset:
+def load_data(
+    dataset_name: str = "synthetic",
+    n_genes: int = N_GENES,
+    world_seed: Optional[int] = None,
+) -> PerturbationDataset:
     """
-    Load a perturbation dataset.
+    Load a perturbation dataset via the appropriate DataAdapter.
 
     Supported datasets:
-    - norman_2019: CRISPRa perturbations in K562 cells (via pertpy)
-    - tahoe_sample: 1M stratified subsample from Tahoe-100M
-    - synthetic: Small synthetic dataset for testing
+    - synthetic:   multi-world synthetic task (default). `world_seed` selects the world;
+                   it defaults to the experiment SEED so each loop seed is a fresh world.
+    - norman_2019: CRISPRa perturbations in K562 cells (via pertpy) — real data (Phase 3).
+    - tahoe_sample: stratified subsample from Tahoe-100M — real data (Phase 3).
     """
-    if dataset_name == "synthetic":
-        return _make_synthetic_dataset(n_genes)
+    ws = WORLD_SEED if world_seed is None else world_seed
 
-    if not HAS_SCANPY or not HAS_PERTPY:
-        print("scanpy and pertpy required for real datasets. Falling back to synthetic.")
-        return _make_synthetic_dataset(n_genes)
+    if dataset_name == "synthetic":
+        return SyntheticAdapter(n_genes=n_genes).load(ws)
+
+    if not HAS_SCANPY:
+        print("scanpy + anndata required for real datasets. Falling back to synthetic.")
+        return SyntheticAdapter(n_genes=n_genes).load(ws)
 
     cache_path = Path(DATA_DIR) / f"{dataset_name}_processed.npz"
     if cache_path.exists():
         return _load_cached(cache_path)
 
-    if dataset_name == "norman_2019":
-        return _load_norman(n_genes, cache_path)
-    elif dataset_name == "tahoe_sample":
-        return _load_tahoe_sample(n_genes, cache_path)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Use 'norman_2019', 'tahoe_sample', or 'synthetic'.")
-
-
-def _make_synthetic_dataset(n_genes: int = 100, n_perts: int = 20, n_cells_per_pert: int = 50) -> PerturbationDataset:
-    """
-    Create a synthetic dataset with biologically realistic complexity.
-
-    Uses DATA_SEED (fixed) for reproducibility across experiment seeds.
-    Includes four layers of complexity that create headroom for smarter models:
-    1. Gene pathway structure (correlated genes, secondary effects)
-    2. Expression-dependent modulation (nonlinear ctrl->effect mapping)
-    3. Cell-type-specific responses (K562 vs HeLa scale differently)
-    4. Shared perturbation structure (pathway-level shared effects)
-
-    Split strategy (hybrid):
-    - 50% perturbations: train-only (all cells in training set)
-    - 20% perturbations: seen-split (cells divided across train/val/test)
-    - 30% perturbations: unseen (all cells in val or test only)
-
-    Perturbation features (target genes, pathway) are provided for ALL
-    perturbations, enabling models to generalize to unseen perturbations.
-    """
-    rng = np.random.RandomState(DATA_SEED)
-    n_samples = n_perts * n_cells_per_pert
-
-    # --- Pathway structure ---
-    n_pathways = min(8, max(2, n_genes // 12))
-    gene_pathway = np.zeros(n_genes, dtype=int)
-    perm = rng.permutation(n_genes)
-    for i, gene_idx in enumerate(perm):
-        gene_pathway[gene_idx] = i % n_pathways
-
-    # Pathway-level shared effects: perturbations hitting the same pathway share a component
-    pathway_shared_effects = {}
-    for pw in range(n_pathways):
-        pathway_shared_effects[pw] = rng.randn(n_genes) * 0.5
-
-    # --- Generate control expression with pathway-correlated structure ---
-    gene_means = rng.exponential(1.5, n_genes)
-    # Add pathway-level correlation: genes in the same pathway share a baseline offset
-    pathway_offsets = rng.randn(n_pathways) * 0.5
-    for g in range(n_genes):
-        gene_means[g] += abs(pathway_offsets[gene_pathway[g]])
-
-    ctrl_expr = rng.poisson(np.maximum(gene_means, 0.1), (n_samples, n_genes)).astype(np.float32)
-
-    # --- Cell type assignments (deterministic per cell) ---
-    cell_types_list = []
-    for p in range(n_perts):
-        for c in range(n_cells_per_pert):
-            cell_types_list.append("K562" if rng.rand() > 0.3 else "HeLa")
-    cell_type_scale = {"K562": 1.0, "HeLa": 0.6}
-
-    # --- Generate perturbation effects with all four complexity layers ---
-    pert_names_list = []
-    pert_types_list = []
-    pert_expr = ctrl_expr.copy()
-    pert_features = {}  # Store features for generalization
-
-    for p in range(n_perts):
-        start = p * n_cells_per_pert
-        end = start + n_cells_per_pert
-        pname = f"PERT_{p:03d}"
-
-        # Primary affected genes (direct targets)
-        n_primary = rng.randint(3, min(15, n_genes))
-        primary_genes = rng.choice(n_genes, n_primary, replace=False)
-        primary_effect = rng.randn(n_primary) * 2.0
-
-        # Secondary affected genes: other genes in the same pathways as primary targets
-        primary_pathways = set(gene_pathway[g] for g in primary_genes)
-        secondary_genes = []
-        for g in range(n_genes):
-            if g not in primary_genes and gene_pathway[g] in primary_pathways:
-                secondary_genes.append(g)
-        secondary_genes = np.array(secondary_genes, dtype=int)
-
-        # Secondary effects: propagated from primary, dampened by 0.3x
-        secondary_effect = np.zeros(len(secondary_genes))
-        if len(secondary_genes) > 0:
-            for sg_idx, sg in enumerate(secondary_genes):
-                pw = gene_pathway[sg]
-                # Average primary effect within this pathway
-                pw_primary_mask = [gene_pathway[pg] == pw for pg in primary_genes]
-                if any(pw_primary_mask):
-                    pw_effects = primary_effect[pw_primary_mask]
-                    secondary_effect[sg_idx] = np.mean(pw_effects) * 0.3
-
-        # Shared pathway component
-        primary_pw = gene_pathway[primary_genes[0]]
-        shared_component_primary = pathway_shared_effects[primary_pw][primary_genes] * 0.4
-        shared_component_secondary = np.zeros(len(secondary_genes))
-        if len(secondary_genes) > 0:
-            shared_component_secondary = pathway_shared_effects[primary_pw][secondary_genes] * 0.2
-
-        # Store perturbation features for generalization
-        pert_features[pname] = {
-            "target_genes": primary_genes.copy(),
-            "pathway": int(primary_pw),
-        }
-
-        # Apply effects per cell with expression-dependent modulation and cell-type scaling
-        for cell_idx in range(start, end):
-            ct = cell_types_list[cell_idx]
-            ct_scale = cell_type_scale[ct]
-
-            # Expression-dependent modulation for primary genes
-            ctrl_vals = ctrl_expr[cell_idx, primary_genes]
-            modulation = 1.0 + 0.5 * np.tanh(
-                (ctrl_vals - gene_means[primary_genes]) / (gene_means[primary_genes] + 1e-6)
-            )
-            total_primary = (primary_effect + shared_component_primary) * modulation * ct_scale
-            pert_expr[cell_idx, primary_genes] += total_primary
-
-            # Secondary effects (also modulated, but less strongly)
-            if len(secondary_genes) > 0:
-                ctrl_sec = ctrl_expr[cell_idx, secondary_genes]
-                mod_sec = 1.0 + 0.3 * np.tanh(
-                    (ctrl_sec - gene_means[secondary_genes]) / (gene_means[secondary_genes] + 1e-6)
-                )
-                total_secondary = (secondary_effect + shared_component_secondary) * mod_sec * ct_scale
-                pert_expr[cell_idx, secondary_genes] += total_secondary
-
-            # Add per-cell noise
-            all_affected = np.concatenate([primary_genes, secondary_genes])
-            noise = rng.randn(len(all_affected)) * 0.3
-            pert_expr[cell_idx, all_affected] += noise
-
-        for _ in range(n_cells_per_pert):
-            pert_names_list.append(pname)
-            pert_types_list.append("gene")
-
-    gene_names = [f"GENE_{i:04d}" for i in range(n_genes)]
-
-    # Compute DEGs from actual perturbation effects (not hard-coded)
-    deg_indices = _compute_degs(ctrl_expr, pert_expr, pert_names_list, n_top=N_TOP_DEGS)
-
-    # --- Hybrid split ---
-    # 50% train-only, 20% seen-split (cells divided), 30% unseen (val/test only)
-    unique_perts = sorted(set(pert_names_list))
-    rng2 = np.random.RandomState(DATA_SEED)
-    rng2.shuffle(unique_perts)
-
-    n_train_only = int(len(unique_perts) * 0.5)   # 10 perts
-    n_seen_split = int(len(unique_perts) * 0.2)    # 4 perts
-    # remaining: unseen perts split between val and test
-
-    train_only_perts = set(unique_perts[:n_train_only])
-    seen_split_perts = list(unique_perts[n_train_only:n_train_only + n_seen_split])
-    unseen_perts = unique_perts[n_train_only + n_seen_split:]
-    n_val_unseen = len(unseen_perts) // 2
-    val_unseen_perts = set(unseen_perts[:n_val_unseen])
-    test_unseen_perts = set(unseen_perts[n_val_unseen:])
-
-    train_idx = []
-    val_idx = []
-    test_idx = []
-
-    # Train-only perturbations: all cells go to train
-    for i, pname in enumerate(pert_names_list):
-        if pname in train_only_perts:
-            train_idx.append(i)
-
-    # Seen-split perturbations: cells divided 70/15/15
-    for pname in seen_split_perts:
-        pert_cell_indices = [i for i, p in enumerate(pert_names_list) if p == pname]
-        rng2.shuffle(pert_cell_indices)
-        n = len(pert_cell_indices)
-        n_tr = int(n * 0.7)
-        n_va = int(n * 0.15)
-        train_idx.extend(pert_cell_indices[:n_tr])
-        val_idx.extend(pert_cell_indices[n_tr:n_tr + n_va])
-        test_idx.extend(pert_cell_indices[n_tr + n_va:])
-
-    # Unseen perturbations: all cells go to val or test
-    for i, pname in enumerate(pert_names_list):
-        if pname in val_unseen_perts:
-            val_idx.append(i)
-        elif pname in test_unseen_perts:
-            test_idx.append(i)
-
-    train_idx = np.array(sorted(train_idx))
-    val_idx = np.array(sorted(val_idx))
-    test_idx = np.array(sorted(test_idx))
-
-    return PerturbationDataset(
-        ctrl_expr=ctrl_expr,
-        pert_expr=pert_expr,
-        pert_names=pert_names_list,
-        pert_types=pert_types_list,
-        cell_types=cell_types_list,
-        gene_names=gene_names,
-        deg_indices=deg_indices,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
-        pert_features=pert_features,
-        gene_pathway=gene_pathway,
-        n_pathways=n_pathways,
+    if dataset_name in ("norman_2019", "tahoe_sample"):
+        return RealAdapter(dataset_name=dataset_name, n_genes=n_genes).load(ws)
+    raise ValueError(
+        f"Unknown dataset: {dataset_name}. Use 'synthetic', 'norman_2019', or 'tahoe_sample'."
     )
 
 
+# Agent-facing schema description. This is what the prompt should show INSTEAD of the
+# data-generating code — it describes the observable data and the objective, but NOT the
+# generative mechanism (which lives, hidden, in _generator.py). Keeping the mechanism out
+# is what makes this a discovery task rather than a transcription task.
+_SCHEMA_DOC = """\
+Perturbation dataset schema (fields available on the object returned by load_data):
+
+  ctrl_expr     float32 [n_cells, n_genes]  control (pre-perturbation) expression
+  pert_expr     float32 [n_cells, n_genes]  observed post-perturbation expression (TARGET)
+  pert_names    list[str]                   perturbation id per cell (e.g. "PERT_003")
+  cell_types    list[str]                   "K562" or "HeLa" per cell
+  pert_features dict[pert -> {target_genes: int[], pathway: int}]
+                                            provided for ALL perturbations, including
+                                            UNSEEN ones — this is how you generalize
+  gene_pathway  int[n_genes]                pathway id per gene
+  deg_indices   dict[pert -> int[20]]       top-20 differentially expressed genes per pert
+  train_idx / val_idx / test_idx            cell indices per split (val_idx == select split)
+
+Splits are hybrid: some perturbations are train-only, some are 'seen' (their cells are
+divided across train/val/test), and some are UNSEEN (their cells appear only in val/test).
+Unseen perturbations still expose target_genes and pathway.
+
+Objective (frozen, see `evaluate`): pearson_deg = per-cell Pearson correlation between the
+PREDICTED delta (pred - ctrl) and the TRUE delta (truth - ctrl) over each perturbation's
+top-20 DEGs. You are scored on capturing the *pattern of change per cell*, not on the
+baseline expression. How control level, cell type, target genes and pathway structure map
+to the delta is for your model to learn from the training split — it is not disclosed here.
+"""
+
+
+def _dataset_from_world(world: GeneratedWorld) -> PerturbationDataset:
+    """Assemble the agent-visible dataset from a generated world.
+
+    DEGs are computed from the OBSERVED expression (part of the frozen eval definition).
+    The world's noise-free oracle signal is not carried into the dataset; it is used only
+    by SyntheticAdapter.oracle_ceiling to compute achievable headroom.
+    """
+    deg_indices = _compute_degs(world.ctrl_expr, world.pert_expr, world.pert_names, n_top=N_TOP_DEGS)
+    splits = Splits(world.train_idx, world.select_idx, world.test_idx, meta=world.split_meta)
+    splits.validate(n_samples=world.ctrl_expr.shape[0])
+    return PerturbationDataset(
+        ctrl_expr=world.ctrl_expr,
+        pert_expr=world.pert_expr,
+        pert_names=world.pert_names,
+        pert_types=world.pert_types,
+        cell_types=world.cell_types,
+        gene_names=world.gene_names,
+        deg_indices=deg_indices,
+        train_idx=world.train_idx,
+        val_idx=world.select_idx,   # `val_idx` retained as an alias for the select split
+        test_idx=world.test_idx,
+        pert_features=world.pert_features,
+        gene_pathway=world.gene_pathway,
+        n_pathways=world.n_pathways,
+        splits=splits,
+    )
+
+
+def _make_synthetic_dataset(
+    n_genes: int = N_GENES, world_seed: Optional[int] = None, **_legacy
+) -> PerturbationDataset:
+    """Build a synthetic dataset for one world (thin wrapper over the hidden generator).
+
+    `world_seed` selects the data realization; it defaults to WORLD_SEED (the experiment
+    SEED), so each of the loop's seeds trains/evaluates on an independent world.
+    """
+    ws = WORLD_SEED if world_seed is None else world_seed
+    return _dataset_from_world(generate_world(ws, n_genes=n_genes))
+
+
+class SyntheticAdapter(DataAdapter):
+    """Multi-world synthetic perturbation data with a computable oracle ceiling."""
+
+    is_synthetic = True
+
+    def __init__(self, n_genes: int = N_GENES):
+        self.n_genes = n_genes
+        self.name = "perturbation:synthetic"
+
+    def load(self, world_seed: int = 0) -> PerturbationDataset:
+        return _make_synthetic_dataset(n_genes=self.n_genes, world_seed=world_seed)
+
+    def describe_schema(self) -> str:
+        return _SCHEMA_DOC
+
+    def oracle_ceiling(self, world_seed: int = 0, split: str = "select") -> dict:
+        """Return metric -> CeilingReport (floor and Bayes-optimal oracle) for one world.
+
+        We regenerate the world to access its hidden noise-free signal, then score the
+        oracle predictor (noise-free expression) and a trivial floor predictor
+        (global mean delta) through the frozen `evaluate`.
+        """
+        world = generate_world(world_seed, n_genes=self.n_genes)
+        deg_indices = _compute_degs(world.ctrl_expr, world.pert_expr, world.pert_names, n_top=N_TOP_DEGS)
+        idx = world.select_idx if split == "select" else world.test_idx
+
+        ctrl = world.ctrl_expr[idx]
+        truth = world.pert_expr[idx]
+        names = [world.pert_names[i] for i in idx]
+        cts = [world.cell_types[i] for i in idx]
+
+        # Oracle: the deterministic (noise-free) post-perturbation expression.
+        m_oracle = evaluate(world.pert_expr_oracle[idx], truth, names, deg_indices,
+                            cell_types=cts, ctrl_expr=ctrl)
+        # Floor: predict the global mean delta (from train) for every cell.
+        global_delta = (
+            world.pert_expr[world.train_idx] - world.ctrl_expr[world.train_idx]
+        ).mean(axis=0)
+        m_floor = evaluate(ctrl + global_delta, truth, names, deg_indices,
+                           cell_types=cts, ctrl_expr=ctrl)
+
+        reports = {}
+        for metric, higher in (("pearson_deg", True), ("direction_acc", True),
+                               ("mse_top20_deg", False)):
+            if metric in m_oracle and metric in m_floor:
+                reports[metric] = CeilingReport(
+                    metric=metric,
+                    floor=float(m_floor[metric]),
+                    oracle=float(m_oracle[metric]),
+                    higher_is_better=higher,
+                )
+        return reports
+
+
+class RealAdapter(DataAdapter):
+    """Real perturbation benchmarks (Norman 2019 / Replogle). Fully wired in Phase 3."""
+
+    is_synthetic = False
+
+    def __init__(self, dataset_name: str = "norman_2019", n_genes: int = N_GENES):
+        self.dataset_name = dataset_name
+        self.n_genes = n_genes
+        self.name = f"perturbation:{dataset_name}"
+
+    def load(self, world_seed: int = 0) -> PerturbationDataset:
+        # Real data is a single world; world_seed is accepted for a uniform interface.
+        cache_path = Path(DATA_DIR) / f"{self.dataset_name}_processed.npz"
+        if cache_path.exists():
+            return _load_cached(cache_path)
+        if self.dataset_name == "norman_2019":
+            return _load_norman(self.n_genes, cache_path)
+        if self.dataset_name == "tahoe_sample":
+            return _load_tahoe_sample(self.n_genes, cache_path)
+        raise ValueError(f"Unknown real dataset: {self.dataset_name}")
+
+
+NORMAN_URL = "https://exampledata.scverse.org/pertpy/norman_2019.h5ad"
+
+
+def _download_h5ad(url: str, dest: Path):
+    """Download an .h5ad with a browser UA (the scverse host 403s the default urllib UA)."""
+    import shutil
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {url} -> {dest} ...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=600) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+
 def _load_norman(n_genes: int, cache_path: Path) -> PerturbationDataset:
-    """Load Norman 2019 CRISPRa dataset via pertpy."""
-    print("Loading Norman 2019 dataset...")
-    adata = pt.dt.norman_2019()
+    """Load the REAL Norman 2019 CRISPRa dataset (K562) directly from its h5ad.
 
-    # Preprocess
-    sc.pp.filter_genes(adata, min_cells=10)
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    sc.pp.highly_variable_genes(adata, n_top_genes=n_genes)
+    pertpy is deliberately NOT imported (its jax dependency conflicts with numpy 1.x); we
+    download the same h5ad pertpy would and read it with anndata. The result matches the
+    synthetic contract — a hybrid seen/unseen perturbation split, and REAL per-perturbation
+    target genes taken from the CRISPR guide identities as pert_features (the feature a model
+    needs to generalize to unseen perturbations).
+    """
+    import anndata as ad
+    from collections import defaultdict
+
+    h5 = Path(DATA_DIR) / "norman_2019.h5ad"
+    if not h5.exists():
+        _download_h5ad(NORMAN_URL, h5)
+    print(f"Loading Norman 2019 from {h5} ...")
+    adata = ad.read_h5ad(h5)
+
+    # Expression is already log-normalized; select highly-variable genes for tractability.
+    sc.pp.highly_variable_genes(adata, n_top_genes=min(n_genes, adata.n_vars))
     adata = adata[:, adata.var.highly_variable].copy()
+    genes = list(map(str, adata.var_names))
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
 
-    # Separate control and perturbed
-    is_ctrl = adata.obs["gene_program"].isna() | (adata.obs["gene_program"] == "ctrl")
-    ctrl_mean = adata[is_ctrl].X.toarray().mean(axis=0) if hasattr(adata[is_ctrl].X, 'toarray') else adata[is_ctrl].X.mean(axis=0)
+    obs = adata.obs
+    pert_all = obs["perturbation_name"].astype(str).values
+    guide_all = obs["guide_ids"].astype(str).values
+    X = adata.X
+    is_ctrl = pert_all == "control"
 
-    # Build dataset
-    pert_mask = ~is_ctrl
-    pert_adata = adata[pert_mask]
-    n_samples = pert_adata.n_obs
+    # Control baseline: mean control expression (sparse-friendly), tiled per perturbed cell.
+    ctrl_mean = np.asarray(X[is_ctrl].mean(axis=0)).ravel().astype(np.float32)
 
+    # Cap perturbed cells per perturbation for tractability; drop perts with too few cells.
+    rng = np.random.RandomState(0)
+    by_pert = defaultdict(list)
+    for i in np.where(~is_ctrl)[0]:
+        by_pert[pert_all[i]].append(int(i))
+    CAP = 50
+    keep: list[int] = []
+    for _p, cells in by_pert.items():
+        if len(cells) < 10:
+            continue
+        rng.shuffle(cells)
+        keep.extend(cells[:CAP])
+    keep = np.array(sorted(keep))
+
+    sub = X[keep]
+    pert_expr = (sub.toarray() if hasattr(sub, "toarray") else np.asarray(sub)).astype(np.float32)
+    n_samples = len(keep)
     ctrl_expr = np.tile(ctrl_mean, (n_samples, 1)).astype(np.float32)
-    pert_expr = pert_adata.X.toarray().astype(np.float32) if hasattr(pert_adata.X, 'toarray') else pert_adata.X.astype(np.float32)
+    pert_names = [pert_all[i] for i in keep]
+    cell_types = ["K562"] * n_samples  # Norman 2019 is entirely K562
 
-    pert_names = list(pert_adata.obs.get("perturbation", pert_adata.obs.index))
-    cell_types = list(pert_adata.obs.get("cell_type", ["K562"] * n_samples))
-    gene_names = list(pert_adata.var_names)
+    # Real per-perturbation target genes from the CRISPR guide identities (e.g. "KLF1,MAP2K6").
+    guide_by_pert: dict[str, str] = {}
+    for i in keep:
+        guide_by_pert.setdefault(pert_all[i], guide_all[i])
+    pert_features = {}
+    for p in set(pert_names):
+        gi = guide_by_pert.get(p, "")
+        targets = [gene_to_idx[g] for g in gi.replace("+", ",").split(",") if g in gene_to_idx]
+        pert_features[p] = {"target_genes": np.array(targets, dtype=int), "pathway": -1}
 
-    # Compute DEGs per perturbation
     deg_indices = _compute_degs(ctrl_expr, pert_expr, pert_names, n_top=N_TOP_DEGS)
 
-    # Split by perturbation
-    unique_perts = list(set(pert_names))
-    rng = np.random.RandomState(SEED)
-    rng.shuffle(unique_perts)
-    n_train = int(len(unique_perts) * TRAIN_SPLIT)
-    n_val = int(len(unique_perts) * VAL_SPLIT)
-    train_perts = set(unique_perts[:n_train])
-    val_perts = set(unique_perts[n_train:n_train + n_val])
-
-    train_idx = np.array([i for i, p in enumerate(pert_names) if p in train_perts])
-    val_idx = np.array([i for i, p in enumerate(pert_names) if p in val_perts])
-    test_idx = np.array([i for i, p in enumerate(pert_names) if p not in train_perts and p not in val_perts])
+    train_idx, select_idx, test_idx, split_meta = _hybrid_split(pert_names, world_seed=0)
+    splits = Splits(train_idx, select_idx, test_idx,
+                    meta={**split_meta, "dataset": "norman_2019"})
+    splits.validate(n_samples=n_samples)
 
     dataset = PerturbationDataset(
         ctrl_expr=ctrl_expr,
@@ -371,13 +373,16 @@ def _load_norman(n_genes: int, cache_path: Path) -> PerturbationDataset:
         pert_names=pert_names,
         pert_types=["gene"] * n_samples,
         cell_types=cell_types,
-        gene_names=gene_names,
+        gene_names=genes,
         deg_indices=deg_indices,
         train_idx=train_idx,
-        val_idx=val_idx,
+        val_idx=select_idx,   # `val_idx` retained as an alias for the select split
         test_idx=test_idx,
+        pert_features=pert_features,
+        gene_pathway=np.full(len(genes), -1, dtype=int),
+        n_pathways=0,
+        splits=splits,
     )
-
     _save_cached(dataset, cache_path)
     return dataset
 
@@ -477,6 +482,7 @@ def _load_cached(path: Path) -> PerturbationDataset:
         pert_features=pert_features,
         gene_pathway=gene_pathway,
         n_pathways=n_pathways,
+        splits=Splits(data["train_idx"], data["val_idx"], data["test_idx"], meta={"cached": True}),
     )
 
 
@@ -645,7 +651,13 @@ if __name__ == "__main__":
     print(f"Val: {len(seen_val)} seen perts + {len(unseen_val)} unseen perts")
     print(f"Test: {len(seen_test)} seen perts + {len(unseen_test)} unseen perts")
 
-    # Test evaluation with baseline predictions
+    # Achievable-headroom report (floor -> Bayes-optimal oracle) for this world.
+    print("\nAchievable ceiling (select split):")
+    ceiling = SyntheticAdapter(n_genes=dataset.n_genes).oracle_ceiling(world_seed=WORLD_SEED)
+    for metric, report in ceiling.items():
+        print(f"  {metric}: floor={report.floor:.4f} -> oracle={report.oracle:.4f}")
+
+    # Test evaluation with baseline predictions, reported against the ceiling.
     rng = np.random.RandomState(42)
     predictions = dataset.ctrl_expr + rng.randn(*dataset.pert_expr.shape) * 0.1
     metrics = evaluate(
